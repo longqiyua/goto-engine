@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    GOTO Engine Kotlin 版 - AndroidManifest.xml
+    作为 Android Library 模块的清单文件。
+    引擎本身不需要任何权限（PackageManager 查询应用列表是 Android 原生 API）。
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" />

@@ -1,0 +1,22 @@
+# GOTO Engine Kotlin 版 - .gitignore
+
+# Gradle
+.gradle/
+build/
+*/build/
+*.apk
+*.aar
+
+# Android Studio / IntelliJ
+.idea/
+*.iml
+local.properties
+captures/
+.cxx/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Kotlin
+*.kotlin_metadata

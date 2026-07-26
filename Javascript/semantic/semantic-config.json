@@ -1,0 +1,111 @@
+{
+  "version": "1.0.0",
+  "generatedAt": "2026-07-19T07:10:04.477Z",
+  "description": "GOTO 语义联想模块分片清单 — 删除此文件或 semantic/ 目录即可禁用语义联想",
+  "synonyms": {
+    "count": 109,
+    "shards": {
+      "0": {
+        "file": "shard-0.json",
+        "count": 9
+      },
+      "a": {
+        "file": "shard-a.json",
+        "count": 2
+      },
+      "b": {
+        "file": "shard-b.json",
+        "count": 4
+      },
+      "c": {
+        "file": "shard-c.json",
+        "count": 6
+      },
+      "d": {
+        "file": "shard-d.json",
+        "count": 10
+      },
+      "e": {
+        "file": "shard-e.json",
+        "count": 1
+      },
+      "f": {
+        "file": "shard-f.json",
+        "count": 5
+      },
+      "g": {
+        "file": "shard-g.json",
+        "count": 6
+      },
+      "h": {
+        "file": "shard-h.json",
+        "count": 1
+      },
+      "j": {
+        "file": "shard-j.json",
+        "count": 5
+      },
+      "k": {
+        "file": "shard-k.json",
+        "count": 5
+      },
+      "l": {
+        "file": "shard-l.json",
+        "count": 4
+      },
+      "m": {
+        "file": "shard-m.json",
+        "count": 6
+      },
+      "n": {
+        "file": "shard-n.json",
+        "count": 2
+      },
+      "p": {
+        "file": "shard-p.json",
+        "count": 4
+      },
+      "q": {
+        "file": "shard-q.json",
+        "count": 3
+      },
+      "r": {
+        "file": "shard-r.json",
+        "count": 5
+      },
+      "s": {
+        "file": "shard-s.json",
+        "count": 6
+      },
+      "t": {
+        "file": "shard-t.json",
+        "count": 3
+      },
+      "w": {
+        "file": "shard-w.json",
+        "count": 6
+      },
+      "x": {
+        "file": "shard-x.json",
+        "count": 6
+      },
+      "y": {
+        "file": "shard-y.json",
+        "count": 8
+      },
+      "z": {
+        "file": "shard-z.json",
+        "count": 2
+      }
+    }
+  },
+  "vectors": {
+    "available": false,
+    "dim": 0,
+    "count": 0,
+    "metaFile": "vectors/meta.json",
+    "shards": {}
+  },
+  "pinyinIndex": "pinyin-index.json",
+  "l1CoreInline": true
+}
