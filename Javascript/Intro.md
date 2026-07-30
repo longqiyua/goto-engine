@@ -197,7 +197,7 @@ GOTOEngineFacade.setAdapter({
 
 ## 6. 版本与扩展点
 
-- **当前版本**：3.2.0（含 L3 mini embedding 与 65 维用户偏好向量）
+- **当前版本**：2.1.0（含 L3 mini embedding 与 65 维用户偏好向量）
 - **扩展方式**：见 `EXTENSIONS.md`
 - **接口定义**：见 `interface.d.ts`
 - **测试**：`run_all_tests.js` 运行所有测试

@@ -92,11 +92,11 @@ class MetaTagIndex {
     )
 
     // 同义强度（在簇内识别到完全一致词时使用）
-    private const val STRENGTH_EXACT = 100          // 完全相等的同义词
-    private const val STRENGTH_PREFIX = 80          // 同义词前缀
-    private const val STRENGTH_CONTAINS = 65        // 同义词包含
-    private const val STRENGTH_CATEGORY_NAME = 95   // 分类名直接匹配
-    private const val STRENGTH_PINYIN_INITIAL = 50 // 拼音首字母匹配分类
+    private val STRENGTH_EXACT = 100          // 完全相等的同义词
+    private val STRENGTH_PREFIX = 80          // 同义词前缀
+    private val STRENGTH_CONTAINS = 65        // 同义词包含
+    private val STRENGTH_CATEGORY_NAME = 95   // 分类名直接匹配
+    private val STRENGTH_PINYIN_INITIAL = 50 // 拼音首字母匹配分类
 
     // LRU 缓存
     private val searchCache: LinkedHashMap<String, List<MetaTagResult>> = LinkedHashMap(64, 0.75f, true)
@@ -164,17 +164,17 @@ class MetaTagIndex {
         val results = mutableListOf<MetaTagResult>()
         val seen = HashSet<String>()
         for (cm in matchedCategories) {
-            val apps = categoryToApps[cm.canonical] ?: continue
+            val apps = categoryToApps[cm.category] ?: continue
             for (app in apps) {
                 if (seen.add(app.packageName)) {
                     results.add(
                         MetaTagResult(
                             app = app,
-                            category = cm.canonical,
+                            category = cm.category,
                             matchedTag = cm.matchedWord,
                             strength = cm.strength,
-                            priority = categoryPriority[cm.canonical] ?: 50,
-                            score = computeFinalScore(cm.strength, categoryPriority[cm.canonical] ?: 50),
+                            priority = categoryPriority[cm.category] ?: 50,
+                            score = computeFinalScore(cm.strength, categoryPriority[cm.category] ?: 50),
                             matchType = MatchType.META_TAG
                         )
                     )
@@ -204,8 +204,7 @@ class MetaTagIndex {
             SearchResult(
                 appInfo = tr.app,
                 score = tr.score,
-                matchType = MatchType.META_TAG,
-                metaTagCategory = tr.category
+                matchType = MatchType.META_TAG
             )
         }
     }
@@ -325,7 +324,7 @@ class MetaTagIndex {
     /**
      * 同义词簇（一组可互换触发的语义相关词）
      */
-    private data class SynonymCluster(
+    private class SynonymCluster(
         val canonical: String,
         vararg val words: String
     )

@@ -1,6 +1,7 @@
 package com.appindex.BasicSearch
 
 import com.appindex.BasicSearch.MetaTagEngine
+import com.appindex.FuzzyMatch.FuzzyMatchEngine
 import com.appindex.model.AppInfo
 import com.appindex.model.MatchType
 import com.appindex.model.SearchMode
@@ -51,6 +52,9 @@ class AppSearchEngine {
 
     /** 元标签树索引：按标签聚类的语义索引（核心特色） */
     private val metaTagIndex = MetaTagIndex()
+
+    /** 模糊匹配引擎（提供智能路由搜索 autoDetectSearch） */
+    private val fuzzyMatchEngine = FuzzyMatchEngine()
 
     /** 字符集复用缓冲区（线程安全） */
     private val charSetBuffer = ThreadLocal.withInitial { BooleanArray(256) }
@@ -280,7 +284,7 @@ class AppSearchEngine {
 
         // 1) 先走智能路由（自动检测语言 + 切换索引树）
         // 1) First, smart-routed search (auto-detect language + switch index tree)
-        val routed = autoDetectSearch(q, apps, appLanguage = "", limit = limit)
+        val routed = fuzzyMatchEngine.autoDetectSearch(q, apps, appLanguage = "", limit = limit)
         if (routed.isNotEmpty()) return routed
 
         val allResults = ConcurrentHashMap<String, SearchResult>()
@@ -367,7 +371,7 @@ class AppSearchEngine {
 
         // 1) 先走智能路由（自动检测语言 + 切换索引树）
         // 1) First, smart-routed search (auto-detect language + switch index tree)
-        val routed = autoDetectSearchParallel(q, apps, appLanguage = "", limit = limit)
+        val routed = fuzzyMatchEngine.autoDetectSearchParallel(q, apps, appLanguage = "", limit = limit)
         if (routed.isNotEmpty()) return routed
 
         return withContext(Dispatchers.Default) {

@@ -6,6 +6,7 @@ import com.appindex.IndexData.AppIndexItem
 import com.appindex.IndexData.CategoryInvertedIndex
 import com.appindex.IndexData.CategorySynonymIndex
 import com.appindex.IndexData.IndexType
+import org.json.JSONObject
 
 /**
  * 索引数据访问对象
@@ -196,7 +197,9 @@ class IndexDao(context: Context) {
         weight: Int,
         appIds: List<String>
     ) {
-        val childrenJson = JsonCodec.mapToJson(children.mapKeys { it.key.toString() })
+        val childrenObj = JSONObject()
+        children.forEach { (k, v) -> childrenObj.put(k.toString(), v) }
+        val childrenJson = childrenObj.toString()
         val values = ContentValues().apply {
             put(FuzzyIndexTable.COL_NODE_ID, nodeId)
             put(FuzzyIndexTable.COL_VALUE, value)
@@ -221,7 +224,14 @@ class IndexDao(context: Context) {
         cursor.use { c ->
             while (c.moveToNext()) {
                 val childrenJson = c.getString(c.getColumnIndexOrThrow(FuzzyIndexTable.COL_CHILDREN))
-                val children = JsonCodec.jsonToMap(childrenJson).mapKeys { it.key.firstOrNull() ?: ' ' }
+                val childrenObj = JSONObject(childrenJson)
+                val children = LinkedHashMap<Char, String>()
+                val childKeys = childrenObj.keys()
+                while (childKeys.hasNext()) {
+                    val k = childKeys.next()
+                    val ch = k.firstOrNull() ?: ' '
+                    children[ch] = childrenObj.optString(k)
+                }
                 list.add(
                     FuzzyNodeRecord(
                         nodeId = c.getString(c.getColumnIndexOrThrow(FuzzyIndexTable.COL_NODE_ID)),

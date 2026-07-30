@@ -7,7 +7,7 @@ plugins {
 }
 
 android {
-    namespace = "com.appindex"
+    namespace = "com.appindex.engine"
     compileSdk = 34
 
     defaultConfig {
@@ -56,6 +56,9 @@ dependencies {
 
     // JSON 处理（用于 JsonCodec.kt）
     implementation("org.json:json:20231013")
+
+    // V2.1: WorkManager（RagMonthlyWorker 月度 RAG 重建调度）
+    implementation("androidx.work:work-runtime-ktx:2.9.0")
 
     // 测试
     testImplementation("junit:junit:4.13.2")

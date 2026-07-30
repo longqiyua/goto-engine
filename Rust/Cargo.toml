@@ -1,10 +1,10 @@
 [package]
 name = "goto-engine"
-version = "3.2.0"
+version = "2.1.0"
 edition = "2021"
 authors = ["GOTO Engine Team"]
 license = "AGPL-3.0-or-later"
-description = "GOTO Engine — local-first smart search & intent engine (Rust port of goto-engine.js v3.2.0)"
+description = "GOTO Engine — local-first smart search & intent engine (Rust port of goto-engine.js v2.1.0)"
 repository = "https://github.com/your-org/goto-engine-rust"
 homepage = "https://github.com/your-org/goto-engine-rust"
 documentation = "https://github.com/your-org/goto-engine-rust"

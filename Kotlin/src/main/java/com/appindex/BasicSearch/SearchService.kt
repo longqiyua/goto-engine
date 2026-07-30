@@ -11,6 +11,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancelChildren
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.launch
@@ -64,7 +65,7 @@ class SearchService private constructor(
     private val serviceScope = CoroutineScope(SupervisorJob() + dispatcher)
 
     // ─── 请求管理 ───
-    private val currentSearchJob = AtomicReference<Job?>()
+    private val currentSearchJob = AtomicReference<Job?>(null)
     private val pendingQueries = ConcurrentLinkedQueue<String>()
     private val isProcessing = AtomicBoolean(false)
 

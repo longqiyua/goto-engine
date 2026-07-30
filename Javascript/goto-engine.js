@@ -123,8 +123,27 @@
     };
   }
 
+  // v4.0: 第四层（梳理层）依赖 — 延迟加载，缺失时静默降级
+  var _rerankModule = null;
+  function _loadRerankModule(){
+    if(_rerankModule) return _rerankModule;
+    try{
+      if(typeof require === 'function'){
+        _rerankModule = require('./algorithms/rerank/personal-rerank.js');
+      }
+    }catch(_){
+      _rerankModule = null;
+    }
+    if(!_rerankModule && global.PersonalRerank){
+      _rerankModule = global.PersonalRerank;
+    }
+    return _rerankModule;
+  }
+  // v4.0: Base 桥接（无状态），由宿主通过 setBaseBridge 注入
+  var _baseBridge = null;
+
   var engine = {
-    version: '3.2.0',
+    version: '2.1.0',
     storage: STORAGE,
     searchIndex: createSearchIndex(),
     context: null,
@@ -134,7 +153,50 @@
     lastSearchContext: global._lastSearchContext || { query:'', list:[], info:{}, latency:0, intentLabel:'待识别' },
     lastRecordId: null,
     datasetVersion: '',
+    // v4.0: 梳理层缓存 — 异步刷新，同步消费（保证搜索零延迟）
+    _personalSnapshot: null,
+    _personalSnapshotTs: 0,
+    _personalSnapshotTTL: 30000,  // 30s 内复用快照，避免每次搜索都打 Base
+    _personalRerankEnabled: true,
+    // v3.3: Engine FeatureFlags — 统一模块开关，三语言必须一致
+    _featureFlags: {
+      fuzzyMatch: true,          // 模糊匹配
+      indexTree: true,           // 索引树（预留，当前用 searchIndex）
+      adaptiveRefresh: true,     // 自适应刷新
+      simInt: false,             // 模拟智能（默认关闭）
+      t9: false,                 // T9 模式
+      ragFallback: false,        // RAG 兜底（默认关闭，最后调用）
+      personalRerank: true,      // L4 梳理层（与 _personalRerankEnabled 同步，向后兼容）
+      ragAutoRebuild: true,      // V2.1: 月度 RAG 自动重建（对齐 Kotlin）
+      ragTransitionEnabled: true // V2.1: RAG 新旧库灰度过渡（对齐 Kotlin）
+    },
+    setFeatureFlags: function(flags){
+      if (flags && typeof flags === 'object') {
+        Object.keys(flags).forEach(function(k) {
+          if (k in engine._featureFlags) {
+            engine._featureFlags[k] = !!flags[k];
+          }
+        });
+        // 同步 personalRerank 到独立变量（向后兼容 _personalRerankEnabled）
+        if ('personalRerank' in flags) {
+          engine._personalRerankEnabled = !!flags.personalRerank;
+        }
+      }
+      // 同步 simInt 到 localStorage
+      if ('simInt' in (flags || {})) {
+        try {
+          if (flags.simInt) {
+            localStorage.setItem('goto_simint_enabled', '1');
+          } else {
+            localStorage.removeItem('goto_simint_enabled');
+          }
+        } catch(_) {}
+      }
+    },
     isSimIntEnabled: function(){
+      // 优先读 FeatureFlags
+      if (engine._featureFlags && engine._featureFlags.simInt === true) return true;
+      // 兼容旧版 localStorage
       try{ return localStorage.getItem(STORAGE.simIntEnabled) === '1'; }
       catch(_){ return false; }
     },
@@ -1042,37 +1104,38 @@
       });
       return inter / (setA.size + setB.size - inter);
     },
-    _sharedCharacterCount: function(a, b){
-      var pool = new Set(lowerText(b).split(''));
-      var count = 0;
-      new Set(lowerText(a).split('')).forEach(function(ch){
-        if(ch.trim() && pool.has(ch)) count += 1;
-      });
-      return count;
-    },
-    _adjacentSwapMatch: function(query, target){
-      query = lowerText(query);
-      target = lowerText(target);
-      if(query.length < 2 || this._sharedCharacterCount(query, target) === 0) return false;
-      for(var i=0;i<query.length-1;i++){
-        if(query[i] === query[i + 1]) continue;
-        var swapped = query.slice(0, i) + query[i + 1] + query[i] + query.slice(i + 2);
-        if(target.indexOf(swapped) >= 0) return true;
-      }
-      return false;
-    },
-    _lcs: function(a, b){
-      if(!a || !b) return 0;
-      var m = a.length;
-      var n = b.length;
-      var dp = new Array(m + 1);
-      for(var i=0;i<=m;i++) dp[i] = new Array(n + 1).fill(0);
-      for(i=1;i<=m;i++){
-        for(var j=1;j<=n;j++){
-          dp[i][j] = a[i - 1] === b[j - 1] ? dp[i - 1][j - 1] + 1 : Math.max(dp[i - 1][j], dp[i][j - 1]);
+    // v3.3: 顺序恢复 — query 字符按顺序出现在 target 中（子序列匹配带评分）
+    // 基础分 200，连续匹配加分（+30×consecutive），间隔字母惩罚（-3×gap，上限 20）
+    _subsequenceScore: function(query, target){
+      if(!query || !target) return 0;
+      var qi = 0, score = 0, consecutive = 0, lastPos = -1;
+      for (var ti = 0; ti < target.length && qi < query.length; ti++) {
+        if (target[ti] === query[qi]) {
+          if (ti === lastPos + 1) {
+            consecutive++;
+            score += 30 * consecutive;
+          } else {
+            consecutive = 0;
+            score += 15;
+            if (lastPos >= 0) {
+              var gap = ti - lastPos - 1;
+              score -= Math.min(gap * 3, 20);
+            }
+          }
+          lastPos = ti;
+          qi++;
         }
       }
-      return dp[m][n];
+      return qi === query.length ? Math.max(50, score) : 0;
+    },
+    // v3.3: 子序列判定 — query 是否为 target 的子序列（仅返回布尔，不评分）
+    _isSubsequence: function(query, target){
+      if(!query || !target) return false;
+      var qi = 0;
+      for (var ti = 0; ti < target.length && qi < query.length; ti++) {
+        if (target[ti] === query[qi]) qi++;
+      }
+      return qi === query.length;
     },
     buildSearchIndex: function(apps){
       var t0 = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
@@ -1260,13 +1323,56 @@
       var t0 = nowTs();
       var lower = q.toLowerCase();
       var isT9Mode = (global._inputLayout === 't9');
-      var useT9 = isT9Mode && /^[2-9]+$/.test(lower);
-      // P1-11 修复：useSuper 读取加 try-catch，避免非浏览器环境（Node 测试）抛 document is not defined
-      var useSuper = false;
-      try{ useSuper = (typeof document !== 'undefined' && document.body && document.body.classList.contains('super-match')) || false; }catch(_){ useSuper = false; }
+      var useT9 = isT9Mode && /^[2-9]+$/.test(lower) && engine._featureFlags.t9;
+      // v3.3: useSuper 改为读 FeatureFlags.fuzzyMatch，兼容旧版 super-match classList
+      var useSuper = engine._featureFlags.fuzzyMatch;
+      try{
+        if(!useSuper && typeof document !== 'undefined' && document.body && document.body.classList.contains('super-match')){
+          useSuper = true;
+        }
+      }catch(_){}
       var idx = this.searchIndex;
       var searchApps = apps || global._appDataset || [];
       this.watchAppDataset(searchApps);
+
+      // v3.3: IndexTree 快速路径 — 当 indexTree flag 开启且 IndexTree 已构建时，先查快捷索引
+      // 快捷索引命中（priority=1000）直接返回，跳过完整模糊匹配
+      if(engine._featureFlags.indexTree && global._indexTree && typeof global._indexTree.search === 'function'){
+        try{
+          var treeResult = global._indexTree.search(lower);
+          if(treeResult.shortcut && treeResult.appIds.length > 0){
+            // 快捷索引命中，直接返回
+            var hitApps = [];
+            treeResult.appIds.forEach(function(id){
+              for(var i=0;i<searchApps.length;i++){
+                if((searchApps[i].id || searchApps[i].name) === id){
+                  hitApps.push(searchApps[i]);
+                  break;
+                }
+              }
+            });
+            if(hitApps.length > 0){
+              var quickScores = {};
+              var quickHits = {};
+              var quickMode = {};
+              hitApps.forEach(function(app, i){
+                var id = app.id || app.name;
+                quickScores[id] = 1000 - i * 10;
+                quickHits[id] = ['快捷索引'];
+                quickMode[id] = '快捷索引';
+              });
+              return {
+                list: hitApps,
+                scores: quickScores,
+                hits: quickHits,
+                modeMap: quickMode,
+                mode: 'shortcut',
+                dt: nowTs() - t0
+              };
+            }
+          }
+        }catch(_){ /* IndexTree 失败则回退正常匹配 */ }
+      }
 
       try{
         var candidateSet = null;
@@ -1302,13 +1408,11 @@
         var abbr = lowerText(app.abbr);
         var cat = lowerText(app.cat);
         var tags = app.tags || [];
-        var bilingualCorpus = lowerText(name + ' ' + py + ' ' + en + ' ' + abbr + ' ' + cat + ' ' + tags.join(' '));
-        var adjacentSwap = /^[a-z]+$/.test(lower) && engine._adjacentSwapMatch(lower, py + ' ' + en + ' ' + name);
         var score = 0;
         var hits = [];
         var querySet = null, jac = 0;
 
-        // v3.3: 独立事件并集 — 每个维度独立运行，取最高分作为基础分
+        // v3.3: MECE 5 维度匹配 — 互斥维度取最高分，分类/标签作为低分兜底
         var dimScores = {};
         // P1-2 修复：统一小写比较，避免 name==='Taobao' 与 q='taobao' 不一致
         var nameLower = name.toLowerCase();
@@ -1322,59 +1426,58 @@
           dimScores['包含'] = 600;
         }
 
-        // 2. 中英混合（独立事件）
-        var mixedTokens = lower.split(/[\s,，·/]+/).filter(Boolean);
-        if(mixedTokens.length > 1 && mixedTokens.every(function(token){ return bilingualCorpus.indexOf(token) >= 0; })){
-          dimScores['中英混合'] = 520;
-        }
+        // 4. 模糊匹配（融合 Jaccard + 顺序恢复 + 拼音缩写 + 英文缩写，取最高分）
+        // 仅在未命中精确/前缀/包含，且 fuzzyMatch 启用时计算
+        if(!dimScores['精确'] && !dimScores['前缀'] && !dimScores['包含'] && engine._featureFlags.fuzzyMatch){
+          var fuzzyCandidates = [];
 
-        // 3. 字符集 Jaccard（独立事件，super 模式）
-        if(useSuper && !adjacentSwap){
-          querySet = new Set(lower.split(''));
-          jac = engine._jaccard(querySet, engine._charSetOf(app));
-          if(jac > 0.5){ dimScores['字符集'] = 400 * jac; }
-        }
+          // 4a. 子序列顺序恢复：query 字符按顺序出现在 target 中（中文同时匹配汉字和拼音）
+          var subSeqScore = engine._subsequenceScore(lower, nameLower);
+          if(subSeqScore === 0 && py) subSeqScore = engine._subsequenceScore(lower, py);
+          if(subSeqScore === 0 && en) subSeqScore = engine._subsequenceScore(lower, en);
+          if(subSeqScore > 0) fuzzyCandidates.push({ name: '顺序恢复', score: Math.min(400, subSeqScore) });
 
-        // 4. 拼音首字母（独立事件）—— 优先用 abbr 字段，否则尝试按空格分音节
-        if(py || abbr){
-          var initials = '';
-          if(abbr){
-            initials = abbr;
-          }else if(py.indexOf(' ') >= 0){
-            initials = py.split(' ').map(function(s){ return s[0] || ''; }).join('');
-          }else{
-            initials = py;
+          // 4b. Jaccard 字符集相似度（super 模式下启用）
+          if(useSuper){
+            querySet = new Set(lower.split(''));
+            jac = engine._jaccard(querySet, engine._charSetOf(app));
+            if(jac > 0.5){ fuzzyCandidates.push({ name: '字符集', score: 400 * jac }); }
           }
-          if(initials.indexOf(lower) === 0){ dimScores['拼音首字母前缀'] = 550; }
-          else if(initials.indexOf(lower) >= 0){ dimScores['拼音首字母包含'] = 350; }
+
+          // 4c. 拼音缩写匹配：query 是拼音首字母的子序列（如 "wx" → "微信"）
+          if(py || abbr){
+            var pyInitials = abbr || (py.indexOf(' ') >= 0 ? py.split(' ').map(function(s){ return s[0] || ''; }).join('') : py);
+            if(pyInitials && engine._isSubsequence(lower, pyInitials)){
+              fuzzyCandidates.push({ name: '拼音缩写', score: 250 });
+            }
+          }
+
+          // 4d. 英文缩写匹配：query 是英文单词首字母的子序列（如 "wx" → "WeChat"）
+          if(en){
+            var enInitials = en.split(/\s+/).map(function(item){ return item[0] || ''; }).join('');
+            if(enInitials && engine._isSubsequence(lower, enInitials)){
+              fuzzyCandidates.push({ name: '英文缩写', score: 250 });
+            }
+          }
+
+          // 取模糊匹配中最高分
+          if(fuzzyCandidates.length > 0){
+            fuzzyCandidates.sort(function(a, b){ return b.score - a.score; });
+            dimScores[fuzzyCandidates[0].name] = fuzzyCandidates[0].score;
+          }
         }
 
-        // 5. 英文缩写（独立事件，super 模式）
-        if(useSuper && en){
-          var enInitials = en.split(/\s+/).map(function(item){ return item[0] || ''; }).join('');
-          if(enInitials.indexOf(lower) === 0){ dimScores['英文缩写'] = 500; }
-        }
-
-        // 6. T9（独立事件，T9 模式）
+        // 5. T9 匹配（T9 模式独有）
         if(useT9){
           var appT9 = engine._toT9String(name + py + en);
           if(appT9.indexOf(lower) === 0){ dimScores['T9前缀'] = 700; }
           else if(appT9.indexOf(lower) >= 0){ dimScores['T9包含'] = 500; }
         }
 
-        // 7. 乱序（独立事件，super 模式）
-        if(useSuper && !adjacentSwap && lower.length >= 2){
-          var pool = lowerText(name + py + en);
-          var allFound = lower.split('').every(function(ch){ return pool.indexOf(ch) >= 0; });
-          if(allFound){ dimScores['乱序'] = 250; }
-        }
-
-        // 8. 分类（独立事件，super 模式）
+        // 低分兜底：分类（80）和标签（50）— 不与上述 5 维度互斥
         if(useSuper && cat.indexOf(lower) >= 0){
           dimScores['分类'] = 80;
         }
-
-        // 9. 标签（独立事件，super 模式）
         if(useSuper){
           tags.some(function(tag){
             if(lowerText(tag).indexOf(lower) >= 0){
@@ -1383,16 +1486,6 @@
             }
             return false;
           });
-        }
-
-        // 10. 邻位交换（独立事件，最低优先级）
-        if(useSuper && adjacentSwap){
-          var adjacentPenalty = 0;
-          for(var ai=0;ai<lower.length-1;ai++){
-            var adjacentDistance = engine._qwertyDist(lower[ai], lower[ai + 1]);
-            if(Number.isFinite(adjacentDistance)) adjacentPenalty += Math.min(3, adjacentDistance);
-          }
-          dimScores['邻位交换'] = Math.max(12, 44 - adjacentPenalty * 3);
         }
 
         // 独立事件并集：取所有维度的最高分 + 记录所有命中的维度
@@ -1689,8 +1782,128 @@
         }
       }
 
+      // RAG 兜底：规则匹配 + SimInt 均无结果时，最后调用 RAG（需启用 ragFallback 并提供 _ragRecall）
+      if(engine._featureFlags.ragFallback && (result.list || []).length === 0 && normalizeText(query).length >= 2){
+        try{
+          if(typeof global._ragRecall === 'function'){
+            var ragHits = global._ragRecall(query, 10) || [];
+            if(ragHits.length > 0){
+              result.list = ragHits;
+              ragHits.forEach(function(app, index){
+                var id = app.id || app.name;
+                result.scores[id] = result.scores[id] || Math.max(20, 50 - index * 5);
+                result.modeMap[id] = result.modeMap[id] || 'RAG 召回';
+              });
+              result.mode = result.mode + '+rag';
+            }
+          }
+        }catch(_){ /* RAG 失败不影响主流程 */ }
+      }
+
       result.intentLabel = result.intentLabel || ((result.hits && Object.keys(result.hits).length) ? '应用直达' : '待识别');
+
+      // v4.0: 第四层 — 梳理层（personal rerank）
+      // 同步消费缓存快照（保证零延迟）；若快照过期则异步刷新供下次使用
+      if(engine._personalRerankEnabled){
+        try{
+          engine._applyPersonalRerankSync(query, result);
+        }catch(_){ /* 梳理层异常不影响主搜索 */ }
+        // 异步刷新快照（不阻塞当前返回）
+        try{
+          engine._refreshPersonalSnapshotAsync(query, result.list || []);
+        }catch(_){ /* 异步刷新失败静默 */ }
+      }
+
       return result;
+    },
+    // v4.0: 同步应用梳理层 — 使用缓存快照
+    _applyPersonalRerankSync: function(query, result){
+      if(!result || !result.list || result.list.length === 0) return;
+      var rerank = _loadRerankModule();
+      if(!rerank || typeof rerank.rerankWithPersonalLayer !== 'function') return;
+      // 快照过期或不存在 → 跳过（等待异步刷新）
+      var now = nowTs();
+      if(!this._personalSnapshot || (now - this._personalSnapshotTs) > this._personalSnapshotTTL){
+        return;
+      }
+      var reranked = rerank.rerankWithPersonalLayer(query, result.list, this._personalSnapshot, {});
+      if(!reranked || !reranked.applied) return;
+      // 原地替换：保留 list 顺序，更新 scores/modeMap
+      result.list = reranked.list;
+      Object.keys(reranked.scores).forEach(function(pkg){
+        result.scores[pkg] = reranked.scores[pkg];
+      });
+      Object.keys(reranked.modeMap).forEach(function(pkg){
+        result.modeMap[pkg] = reranked.modeMap[pkg];
+      });
+      result.rerankApplied = true;
+      result.rerankExplanation = reranked.explanation;
+    },
+    // v4.0: 异步刷新梳理层快照（不阻塞当前搜索）
+    _refreshPersonalSnapshotAsync: function(query, list){
+      var self = this;
+      if(!_baseBridge || _baseBridge.degraded) return;
+      var packages = (list || []).map(function(app){
+        return app.packageName || app.id || app.name || '';
+      }).filter(Boolean);
+      if(packages.length === 0) return;
+      var ctx = {
+        hour: getHour(),
+        weekday: new Date().getDay(),
+        geofenceId: (this.context && this.context.geofenceId) || '',
+        foregroundPackage: (this.context && this.context.previousAppPackage) || ''
+      };
+      try{
+        Promise.resolve(_baseBridge.getPersonalSnapshot(query, packages, ctx)).then(function(snap){
+          if(snap){
+            self._personalSnapshot = snap;
+            self._personalSnapshotTs = nowTs();
+          }
+        }).catch(function(_){ /* 快照刷新失败静默 */ });
+      }catch(_){ /* 桥接异常静默 */ }
+    },
+    // v4.0: 注入 Base 桥接（由宿主在 Base 加载完成后调用）
+    setBaseBridge: function(bridge){
+      _baseBridge = bridge || null;
+      return this;
+    },
+    getBaseBridgeStatus: function(){
+      return _baseBridge ? _baseBridge.status() : { available: false, degraded: true };
+    },
+    // v4.0: 用户点击 → 写入 Base feedback-chain
+    // 注意：不替换原有 recordSelection（保留 localStorage 学习路径以兼容），
+    // 仅额外写入 Base 个人层，作为梳理层的反馈源
+    recordSelectionToBase: function(query, clickedApp, rank, candidateCount, matchMode, context){
+      if(!_baseBridge || _baseBridge.degraded) return null;
+      if(!clickedApp) return null;
+      var q = normalizeText(query);
+      var list = (global._lastSearchContext && global._lastSearchContext.list) || [];
+      var pkg = clickedApp;
+      // 尝试从 dataset 反查 packageName
+      try{
+        var found = list.find(function(app){ return (app.name || '') === clickedApp; });
+        if(found && found.packageName) pkg = found.packageName;
+      }catch(_){}
+      var evt = {
+        query: q,
+        normalizedQuery: lowerText(q),
+        clickedPackage: pkg,
+        clickedAppName: clickedApp,
+        clickedRank: typeof rank === 'number' ? rank : -1,
+        candidateCount: typeof candidateCount === 'number' ? candidateCount : (list.length || 0),
+        matchMode: matchMode || 'fuzzy',
+        context: context || {
+          hour: getHour(),
+          weekday: new Date().getDay(),
+          geofenceId: (this.context && this.context.geofenceId) || '',
+          foregroundPackage: (this.context && this.context.previousAppPackage) || ''
+        }
+      };
+      try{
+        return Promise.resolve(_baseBridge.recordFeedbackChainEvent(evt));
+      }catch(_){
+        return null;
+      }
     },
     _touchRuleStats: function(query, appName){
       var stats = this.getRuleStats();
@@ -2055,6 +2268,19 @@
       target.isMisfire = isMisfire; // v3.3: 标记误操作
       this.saveMemory(memory);
 
+      // v4.0: 同步写入 Base feedback-chain（梳理层反馈源）
+      // 误操作不写入 Base，避免污染个人层
+      if(!isMisfire){
+        try{
+          this.recordSelectionToBase(
+            q, clickedApp,
+            target.clickedRank !== null ? (target.clickedRank - 1) : -1,  // 转 0-based
+            (target.candidates || []).length,
+            target.clickedMode || 'fuzzy'
+          );
+        }catch(_){ /* Base 写入失败不影响主流程 */ }
+      }
+
       // v3.3: 误操作不更新统计（和自适应刷新同一个重复修正逻辑）
       if(!isMisfire){
         this._touchRuleStats(q, clickedApp);
@@ -2122,25 +2348,19 @@
       return readJSON(STORAGE.clickDelayEMA, { value: 600, samples: 0 }) || { value: 600, samples: 0 };
     },
     // v3.2: 犹豫补偿延迟 — 自适应刷新系统可调用，返回额外延迟毫秒数
-    // 当检测到邻位交换或显著键距时，返回 80ms 额外延迟以等待用户修正输入
+    // 当检测到显著键距时，返回 80ms 额外延迟以等待用户修正输入
     getHesitationDelay: function(query){
+      // 自适应刷新层关闭时不延迟
+      if(!engine._featureFlags.adaptiveRefresh) return 0;
       if(!this.isSimIntEnabled()) return 0;
       var q = this.sanitizeQuery(query);
       if(!q) return 0;
       var lower = q.toLowerCase();
       // 检查是否会触发高斯键距惩罚
       if(!/^[a-z]+$/.test(lower) || lower.length < 2) return 0;
-      // 检查上次搜索是否触发了邻位交换
-      var ctx = global._lastSearchContext || this.lastSearchContext || {};
-      var hits = (ctx.info || {}).hits || {};
-      var modeMap = (ctx.info || {}).modeMap || {};
-      var hasSwap = false;
-      Object.keys(hits).forEach(function(key){
-        if(hits[key] && hits[key].indexOf('邻位交换') >= 0) hasSwap = true;
-      });
-      if(hasSwap) return 80; // 80ms 额外延迟
-      // 检查是否有结果存在显著键距
+      // 检查上次搜索是否有结果存在显著键距
       // P3-1 修复：appName 为中文时，应取 py/en 作为键距比较目标，否则因子恒≈0 触发误延迟
+      var ctx = global._lastSearchContext || this.lastSearchContext || {};
       var list = ctx.list || [];
       for(var i=0; i<Math.min(list.length, 3); i++){
         var app = list[i] || {};
@@ -2556,6 +2776,34 @@
       // v3.2 用户数据向量化 + 导出 embedding
       global._vectorizeUserData = this.vectorizeUserData.bind(this);
       global._exportEmbedding = this.exportEmbedding.bind(this);
+      // v3.2 自适应刷新层 API 暴露 — 供宿主页（如 index.html）调用
+      global._recordClickDelay = this.recordClickDelay.bind(this);
+      global._getClickDelayEMA = this.getClickDelayEMA.bind(this);
+      global._getHesitationDelay = this.getHesitationDelay.bind(this);
+      // FeatureFlags 暴露
+      global._setEngineFeatureFlags = this.setFeatureFlags.bind(this);
+      global._getEngineFeatureFlags = function(){ return Object.assign({}, engine._featureFlags); };
+      // v4.0: 第四层（梳理层）+ Base 桥接 API 暴露
+      global._setEngineBaseBridge = this.setBaseBridge.bind(this);
+      global._getEngineBaseBridgeStatus = this.getBaseBridgeStatus.bind(this);
+      global._recordSelectionToBase = this.recordSelectionToBase.bind(this);
+      global._applyPersonalRerank = this._applyPersonalRerankSync.bind(this);
+      global._refreshPersonalSnapshot = this._refreshPersonalSnapshotAsync.bind(this);
+      global._setPersonalRerankEnabled = function(enabled){
+        engine._personalRerankEnabled = !!enabled;
+        return engine._personalRerankEnabled;
+      };
+      global._isPersonalRerankEnabled = function(){
+        return !!engine._personalRerankEnabled;
+      };
+      global._getPersonalRerankSnapshot = function(){
+        return {
+          snapshot: engine._personalSnapshot,
+          takenAt: engine._personalSnapshotTs,
+          age: nowTs() - (engine._personalSnapshotTs || 0),
+          ttl: engine._personalSnapshotTTL
+        };
+      };
       this.rebuildIndex();
       this.watchAppDataset(global._appDataset || []);
       this.clearExpiredBlockFlags();

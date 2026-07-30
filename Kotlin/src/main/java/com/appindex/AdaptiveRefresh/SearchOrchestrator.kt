@@ -1,5 +1,6 @@
 package com.appindex.AdaptiveRefresh
 
+import com.appindex.BasicSearch.SearchService
 import com.appindex.model.SearchMode
 import com.appindex.Personalization.TypingSpeedTracker
 import kotlinx.coroutines.CoroutineScope
@@ -12,6 +13,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlin.math.roundToInt
 
 /**
  * ╔══════════════════════════════════════════════════════════════════════════════╗

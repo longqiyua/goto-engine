@@ -1,5 +1,6 @@
 package com.appindex.component
 
+import com.appindex.Maintenance.MaintenanceManager
 import com.appindex.model.SearchResult
 
 /**
@@ -81,6 +82,17 @@ interface GotoEngineFacade {
     fun maintain()
 
     /**
+     * 获取自主维护管理器实例（可选）。
+     *
+     * Kotlin 版引擎核心无状态，权重/链边/记忆/屏蔽标记存储由 app 层持有。
+     * 当 app 层已注入存储并构造好 [MaintenanceManager] 时返回实例，否则返回 null。
+     * 调用方可通过返回值手动触发 `applySelfHealing` 等需要存储的能力。
+     *
+     * 默认返回 null（不破坏现有实现类），由需要维护能力的实现覆盖。
+     */
+    fun getMaintenanceManager(): MaintenanceManager? = null
+
+    /**
      * 引擎是否就绪（已设置数据集且索引可用）。
      */
     fun isReady(): Boolean
@@ -89,4 +101,11 @@ interface GotoEngineFacade {
      * 当前数据集大小。
      */
     fun datasetSize(): Int
+
+    /**
+     * 触发 RAG 重建（月度 Worker 的手动触发入口；读应用清单 + base 个人层 → 生成向量 → 启动灰度过渡）。
+     * V2.1 新增。
+     * @return true 表示成功启动重建，false 表示前置条件不满足（如 embedder 未注入）
+     */
+    fun rebuildRag(): Boolean
 }

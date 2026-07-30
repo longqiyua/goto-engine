@@ -612,7 +612,7 @@ mod tests {
     #[test]
     fn test_engine_new() {
         let engine = GotoEngine::new();
-        assert_eq!(engine.version(), "3.2.0");
+        assert_eq!(engine.version(), "2.1.0");
     }
 
     #[test]
