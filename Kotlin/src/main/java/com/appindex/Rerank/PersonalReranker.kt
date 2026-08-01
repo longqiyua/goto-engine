@@ -1,256 +1,344 @@
 package com.appindex.Rerank
 
+import com.appindex.model.MatchType
 import com.appindex.model.SearchResult
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.pow
 
 /**
- * GOTO Engine · L4 梳理层 — 个人化重排器（纯函数）
+ * GOTO Engine · 第四层（梳理层）— 个人化重排器
  *
- * 与 JS 版 `algorithms/rerank/personal-rerank.js` 的 `rerankWithPersonalLayer` 对齐。
+ * 纯函数重排：融合 Base 个人层 5 个 schema 的 boost，对引擎结果做最终排序。
+ * 对应 JS 版 `algorithms/rerank/personal-rerank.js`。
  *
- * 设计原则：
- *   - 纯函数：不读写 IO，不修改入参，返回新列表
- *   - 5 schema 融合：heatmap / hourly-ranking / transition-matrix / user-context / feedback-chain
- *   - 精确匹配保护：exact-match 永远排第一，不受 personalBoost 影响
- *   - 总帽保护：5 源 + affinity 总和上限 totalPersonalBoostMax
- *   - 降级模式：snapshot 为 null/degraded 时返回原序，applied=false
+ * 五个独立 boost（每个独立限幅，总和再限帽）：
+ *   1. heatmap         — 当前 hour×weekday 的启动密度
+ *   2. hourly-ranking  — smartRanking 融合的按时段候选
+ *   3. transition-matrix — 前台应用→候选应用的转移概率
+ *   4. user-context    — 地理围栏偏好权重
+ *   5. feedback-chain  — 近期点击的时近性/频次
  *
- * v2.1 新增
+ * 总帽保护：personalBoost 不超过原 score 的 30%。
+ * 精确匹配保护：exact-match 候选始终保持在顶部。
+ * 降级模式：snapshot 为降级或列表为空时返回 applied=false。
  */
 object PersonalReranker {
 
-    data class Config(
-        val heatmapBoostMax: Double = 0.15,
-        val hourlyRankingBoostMax: Double = 0.20,
-        val transitionBoostMax: Double = 0.15,
-        val geofenceBoostMax: Double = 0.15,
-        val feedbackBoostMax: Double = 0.20,
-        val totalPersonalBoostMax: Double = 0.50,
-        val feedbackHalfLifeEvents: Int = 20,
-        val heatmapDensityBaseline: Int = 5,
-        val transitionNoiseFloor: Double = 0.05
-    )
+    /** 重排结果 */
+    data class RerankResult(val applied: Boolean, val list: List<SearchResult>)
+
+    // ── 配置常量（与 JS 版 DEFAULT_CONFIG 对齐） ──
+
+    /** boost 1 上限：heatmap */
+    private const val HEATMAP_BOOST_MAX = 0.15
+
+    /** boost 2 上限：hourly-ranking */
+    private const val HOURLY_RANKING_BOOST_MAX = 0.20
+
+    /** boost 3 上限：transition-matrix */
+    private const val TRANSITION_BOOST_MAX = 0.15
+
+    /** boost 4 上限：user-context (geofence) */
+    private const val GEOFENCE_BOOST_MAX = 0.15
+
+    /** boost 5 上限：feedback-chain */
+    private const val FEEDBACK_BOOST_MAX = 0.20
+
+    /** 五个 boost 总和上限 */
+    private const val TOTAL_PERSONAL_BOOST_MAX = 0.50
+
+    /** feedback 衰减半衰期（事件数） */
+    private const val FEEDBACK_HALF_LIFE_EVENTS = 20
+
+    /** heatmap 密度归一化基线 */
+    private const val HEATMAP_DENSITY_BASELINE = 5
+
+    /** transition 噪声阈值，低于此概率忽略 */
+    private const val TRANSITION_NOISE_FLOOR = 0.05
+
+    /** 总帽保护：personalBoost 不超过原 score 的 30% */
+    private const val SCORE_CAP_RATIO = 0.30
 
     /**
-     * 应用 L4 梳理层重排。
+     * 对引擎结果应用第四层个人化重排。
      *
-     * @param query 归一化查询
-     * @param engineResults Engine 候选（L1/L2/L3 输出）
-     * @param snapshot Base 个人层快照（可为 null）
-     * @param config 配置
-     * @return RerankResult
+     * @param query     归一化查询字符串
+     * @param list      引擎候选结果列表
+     * @param snapshot  个人层快照（来自 EngineBaseBridge）
+     * @return 重排结果，[RerankResult.applied] 为 true 时 [RerankResult.list] 为重排后的列表
      */
-    fun rerank(
-        query: String,
-        engineResults: List<SearchResult>,
-        snapshot: PersonalSnapshot?,
-        config: Config = Config()
-    ): RerankResult {
-        // 降级：snapshot 为 null 或标记为 degraded，或输入为空
-        if (snapshot == null || snapshot.degraded || engineResults.isEmpty()) {
-            return RerankResult.degraded(engineResults)
+    fun rerank(query: String, list: List<SearchResult>, snapshot: PersonalSnapshot): RerankResult {
+        // 降级或空列表：直接返回，不应用重排
+        if (snapshot.degraded || list.isEmpty()) {
+            return RerankResult(applied = false, list = list)
         }
 
-        // 步骤 1: 计算每个候选的 finalScore 和 boost
-        data class Enriched(
-            val original: SearchResult,
-            val packageName: String,
-            val engineScore: Double,
-            val personalBoost: Double,
-            val finalScore: Double,
-            val isExactMatch: Boolean,
-            val boostSources: List<String>
-        )
+        val q = query.lowercase().trim()
 
-        val qLower = query.lowercase().trim()
-        val enriched = engineResults.map { r ->
-            val pkg = r.appInfo.packageName
-            val name = r.appInfo.label
-            val engineScore = r.score.toDouble()
+        // 为每个候选拼装 5 个 boost，计算最终分数
+        val enriched = list.mapIndexed { originalIndex, result ->
+            val pkg = result.appInfo.packageName
+            val originalScore = result.score.toDouble()
 
-            // 精确匹配检测
-            val isExact = name.lowercase().trim() == qLower && qLower.isNotEmpty()
+            // 计算 5 个 boost（各自在 [0, boostMax] 区间）
+            val b1 = heatmapBoost(pkg, snapshot)
+            val b2 = hourlyRankingBoost(pkg, snapshot)
+            val b3 = transitionBoost(pkg, snapshot)
+            val b4 = geofenceBoost(pkg, snapshot)
+            val b5 = feedbackBoost(pkg, q, snapshot)
 
-            // 5 个 boost
-            val boosts = mutableListOf<String>()
-            var total = 0.0
+            // 求和并限帽
+            val rawSum = b1 + b2 + b3 + b4 + b5
+            val cappedSum = min(rawSum, TOTAL_PERSONAL_BOOST_MAX)
 
-            val b1 = heatmapBoost(pkg, snapshot, config)
-            if (b1 > 0) { boosts.add("heatmap=${round4(b1)}"); total += b1 }
+            // 转换为 0~1 的个人化因子，再按原 score 的 30% 上限折算实际加分
+            val personalFactor = if (TOTAL_PERSONAL_BOOST_MAX > 0.0) cappedSum / TOTAL_PERSONAL_BOOST_MAX else 0.0
+            val scoreBoost = personalFactor * originalScore * SCORE_CAP_RATIO
+            val finalScore = originalScore + scoreBoost
 
-            val b2 = hourlyRankingBoost(pkg, snapshot, config)
-            if (b2 > 0) { boosts.add("hourly=${round4(b2)}"); total += b2 }
-
-            val b3 = transitionBoost(pkg, snapshot, config)
-            if (b3 > 0) { boosts.add("transition=${round4(b3)}"); total += b3 }
-
-            val b4 = geofenceBoost(pkg, snapshot, config)
-            if (b4 > 0) { boosts.add("geofence=${round4(b4)}"); total += b4 }
-
-            val b5 = feedbackBoost(pkg, qLower, snapshot, config)
-            if (b5 > 0) { boosts.add("feedback=${round4(b5)}"); total += b5 }
-
-            // 总帽
-            val capped = clampNum(total, 0.0, config.totalPersonalBoostMax)
-
-            Enriched(
-                original = r,
+            EnrichedEntry(
+                originalIndex = originalIndex,
                 packageName = pkg,
-                engineScore = engineScore,
-                personalBoost = round4(capped),
-                finalScore = round4(engineScore + capped),
-                isExactMatch = isExact,
-                boostSources = boosts
+                finalScore = finalScore,
+                isExact = result.matchType == MatchType.EXACT
             )
         }
 
-        // 步骤 2: 排序 — 精确匹配优先，否则 finalScore 降序（稳定排序）
-        val sorted = enriched.sortedWith(compareByDescending<Enriched> { it.isExactMatch }
-            .thenByDescending { it.finalScore })
-
-        // 步骤 3: 构造结果
-        val list = sorted.map { it.original }
-        val scores = sorted.associate { it.packageName to it.finalScore }
-        val modeMap = sorted.associate {
-            it.packageName to (if (it.isExactMatch) "exact-match"
-                              else if (it.boostSources.isNotEmpty()) "个人重排"
-                              else "engine-only")
-        }
-        val explanation = sorted.filter { it.boostSources.isNotEmpty() }
-            .associate { it.packageName to it.boostSources.joinToString("; ") }
-
-        return RerankResult(
-            list = list,
-            scores = scores,
-            modeMap = modeMap,
-            explanation = explanation,
-            degraded = false,
-            applied = true
+        // 稳定排序：exact-match 优先 → finalScore 降序 → 原始顺序
+        val sorted = enriched.sortedWith(
+            compareByDescending<EnrichedEntry> { it.isExact }
+                .thenByDescending { it.finalScore }
+                .thenBy { it.originalIndex }
         )
+
+        // 映射回原始 SearchResult，更新 score
+        val reranked = sorted.map { entry ->
+            val original = list[entry.originalIndex]
+            val newScore = entry.finalScore.toInt()
+            if (newScore != original.score) original.copy(score = newScore) else original
+        }
+
+        return RerankResult(applied = true, list = reranked)
     }
 
     // ============================================================
-    // Boost 1 — Heatmap
+    // 内部数据结构
     // ============================================================
-    private fun heatmapBoost(pkg: String, snap: PersonalSnapshot, cfg: Config): Double {
-        val heatmap = snap.heatmap ?: return 0.0
-        val hour = snap.runtimeContext.hour
-        val weekday = snap.runtimeContext.weekday
-        val cell = heatmap.cells.find { it.hour == hour && it.weekday == weekday } ?: return 0.0
-        if (cell.launchCount <= 0) return 0.0
-        val pkgCount = cell.topApps.find { it.packageName == pkg }?.count ?: 0
+
+    private data class EnrichedEntry(
+        val originalIndex: Int,
+        val packageName: String,
+        val finalScore: Double,
+        val isExact: Boolean
+    )
+
+    // ============================================================
+    // Boost 1 — Heatmap（当前 hour×weekday 启动密度）
+    // ============================================================
+
+    private fun heatmapBoost(packageName: String, snapshot: PersonalSnapshot): Double {
+        val heatmapObj = asMap(snapshot.heatmap) ?: return 0.0
+        val cells = asList(heatmapObj["heatmap"]) ?: return 0.0
+        val ctx = snapshot.runtimeContext
+        if (ctx.hour < 0 || ctx.weekday < 0) return 0.0
+
+        // 查找匹配 hour×weekday 的格子
+        val cell = cells.mapNotNull { asMap(it) }.firstOrNull { c ->
+            asInt(c["hour"]) == ctx.hour && asInt(c["weekday"]) == ctx.weekday
+        } ?: return 0.0
+
+        val total = asInt(cell["launchCount"])
+        if (total <= 0) return 0.0
+
+        val topApps = asList(cell["topApps"]) ?: return 0.0
+        val pkgCount = topApps.mapNotNull { asMap(it) }.firstOrNull { a ->
+            asString(a["packageName"]) == packageName
+        }?.let { asInt(it["count"]) } ?: 0
         if (pkgCount <= 0) return 0.0
-        val density = pkgCount.toDouble() / max(cfg.heatmapDensityBaseline, cell.launchCount).toDouble()
-        return clampNum(density, 0.0, 1.0) * cfg.heatmapBoostMax
+
+        val density = pkgCount.toDouble() / max(HEATMAP_DENSITY_BASELINE, total).toDouble()
+        return clamp(density, 0.0, 1.0) * HEATMAP_BOOST_MAX
     }
 
     // ============================================================
-    // Boost 2 — Hourly Ranking
+    // Boost 2 — Hourly Ranking（smartRanking 融合候选）
     // ============================================================
-    private fun hourlyRankingBoost(pkg: String, snap: PersonalSnapshot, cfg: Config): Double {
-        val hr = snap.hourlyRanking ?: return 0.0
-        val hour = snap.runtimeContext.hour
 
-        // 1) per-hour ranking
-        val hourList = hr.hourlyRanking[hour.toString()]
-        if (hourList != null) {
-            val e = hourList.find { it.packageName == pkg }
-            if (e != null) {
-                val freq = clampNum(e.count.toDouble() / 10.0, 0.0, 1.0)
-                val rec = clampNum(e.recencyScore, 0.0, 1.0)
-                return clampNum(freq * 0.5 + rec * 0.5, 0.0, 1.0) * cfg.hourlyRankingBoostMax
+    private fun hourlyRankingBoost(packageName: String, snapshot: PersonalSnapshot): Double {
+        val hr = asMap(snapshot.hourlyRanking) ?: return 0.0
+        val ctx = snapshot.runtimeContext
+        if (ctx.hour < 0) return 0.0
+
+        // 1) 优先查按时段的逐小时排名
+        val hourly = asMap(hr["hourlyRanking"])
+        if (hourly != null) {
+            val hourList = asList(hourly[ctx.hour.toString()])
+            if (hourList != null) {
+                for (item in hourList) {
+                    val e = asMap(item) ?: continue
+                    if (asString(e["packageName"]) == packageName) {
+                        val recency = asDouble(e["recencyScore"])
+                        val count = asInt(e["count"])
+                        // 频次（归一化到 0~1）与时近性各占 50%
+                        val freq = clamp(count.toDouble() / 10.0, 0.0, 1.0)
+                        return clamp(freq * 0.5 + recency * 0.5, 0.0, 1.0) * HOURLY_RANKING_BOOST_MAX
+                    }
+                }
             }
         }
 
-        // 2) smartRanking fallback
-        val smart = hr.smartRanking ?: return 0.0
-        val top = smart.topCandidates
-        val idx = top.indexOfFirst { it.packageName == pkg }
-        if (idx < 0) return 0.0
-        val posFactor = clampNum(1.0 - idx.toDouble() / max(1, top.size).toDouble(), 0.0, 1.0)
-        val norm = clampNum(top[idx].score / 10.0, 0.0, 1.0)
-        return clampNum(posFactor * 0.6 + norm * 0.4, 0.0, 1.0) * cfg.hourlyRankingBoostMax
+        // 2) 回退到 smartRanking.topCandidates（全局融合排名）
+        val smart = asMap(hr["smartRanking"])
+        if (smart != null) {
+            val top = asList(smart["topCandidates"])
+            if (top != null) {
+                for ((idx, item) in top.withIndex()) {
+                    val c = asMap(item) ?: continue
+                    if (asString(c["packageName"]) == packageName) {
+                        // 按位置衰减：rank 1 → 满分，线性递减
+                        val pos = idx + 1
+                        val posFactor = clamp(1.0 - (pos - 1) / max(1, top.size).toDouble(), 0.0, 1.0)
+                        val raw = asDouble(c["score"])
+                        // 假设 raw 分数典型范围 [0, 10]，做防御性归一化
+                        val norm = clamp(raw / 10.0, 0.0, 1.0)
+                        return clamp(posFactor * 0.6 + norm * 0.4, 0.0, 1.0) * HOURLY_RANKING_BOOST_MAX
+                    }
+                }
+            }
+        }
+        return 0.0
     }
 
     // ============================================================
-    // Boost 3 — Transition Matrix
+    // Boost 3 — Transition Matrix（前台应用→候选转移概率）
     // ============================================================
-    private fun transitionBoost(pkg: String, snap: PersonalSnapshot, cfg: Config): Double {
-        val tm = snap.transitionMatrix ?: return 0.0
-        val from = snap.runtimeContext.foregroundPackage
+
+    private fun transitionBoost(packageName: String, snapshot: PersonalSnapshot): Double {
+        val tm = asMap(snapshot.transitionMatrix) ?: return 0.0
+        val ctx = snapshot.runtimeContext
+        val from = ctx.foregroundPackage
         if (from.isEmpty()) return 0.0
-        val list = tm.transitions[from] ?: return 0.0
-        val edge = list.find { it.toPackage == pkg } ?: return 0.0
-        if (edge.probability < cfg.transitionNoiseFloor) return 0.0
-        var recFactor = 1.0
-        edge.lastOccurred?.let { ts ->
-            val lastOcc = parseIsoTime(ts)
-            if (lastOcc > 0) {
-                val daysSince = (System.currentTimeMillis() - lastOcc) / (24.0 * 60 * 60 * 1000)
-                recFactor = clampNum(0.5.pow(daysSince / 30.0), 0.0, 1.0)
+
+        val transitions = asMap(tm["transitions"]) ?: return 0.0
+        val list = asList(transitions[from]) ?: return 0.0
+
+        for (item in list) {
+            val t = asMap(item) ?: continue
+            if (asString(t["toPackage"]) == packageName) {
+                val p = asDouble(t["probability"])
+                if (p < TRANSITION_NOISE_FLOOR) return 0.0
+                // 时近性折扣：超过 30 天的转移按半衰衰减
+                val lastOcc = asString(t["lastOccurred"])
+                var recFactor = 1.0
+                val lastMs = parseIsoTimestamp(lastOcc)
+                if (lastMs > 0) {
+                    val daysSince = (System.currentTimeMillis() - lastMs) / (24.0 * 60.0 * 60.0 * 1000.0)
+                    recFactor = clamp(0.5.pow(daysSince / 30.0), 0.0, 1.0)
+                }
+                return clamp(p * recFactor, 0.0, 1.0) * TRANSITION_BOOST_MAX
             }
         }
-        return clampNum(edge.probability * recFactor, 0.0, 1.0) * cfg.transitionBoostMax
+        return 0.0
     }
 
     // ============================================================
-    // Boost 4 — Geofence / User Context
+    // Boost 4 — User Context（地理围栏偏好权重）
     // ============================================================
-    private fun geofenceBoost(pkg: String, snap: PersonalSnapshot, cfg: Config): Double {
-        val uc = snap.userContext ?: return 0.0
-        val geoId = snap.runtimeContext.geofenceId
+
+    private fun geofenceBoost(packageName: String, snapshot: PersonalSnapshot): Double {
+        val uc = asMap(snapshot.userContext) ?: return 0.0
+        val ctx = snapshot.runtimeContext
+        val geoId = ctx.geofenceId
         if (geoId.isEmpty()) return 0.0
-        val pref = uc.preferredApps.find { it.geofenceId == geoId && it.packageName == pkg }
-            ?: return 0.0
-        return clampNum(pref.weight, 0.0, 1.0) * cfg.geofenceBoostMax
+
+        val prefs = asList(uc["preferredApps"]) ?: return 0.0
+        for (item in prefs) {
+            val p = asMap(item) ?: continue
+            if (asString(p["geofenceId"]) == geoId && asString(p["packageName"]) == packageName) {
+                return clamp(asDouble(p["weight"]), 0.0, 1.0) * GEOFENCE_BOOST_MAX
+            }
+        }
+        return 0.0
     }
 
     // ============================================================
-    // Boost 5 — Feedback Chain
+    // Boost 5 — Feedback Chain（近期点击时近性/频次）
     // ============================================================
-    private fun feedbackBoost(pkg: String, query: String, snap: PersonalSnapshot, cfg: Config): Double {
-        val events = snap.recentFeedback
+
+    private fun feedbackBoost(packageName: String, query: String, snapshot: PersonalSnapshot): Double {
+        val events = asList(snapshot.recentFeedback) ?: return 0.0
         if (events.isEmpty()) return 0.0
-        val halfLife = cfg.feedbackHalfLifeEvents.coerceAtLeast(1)
+
         var boost = 0.0
-        events.forEachIndexed { i, e ->
-            if (e.clickedPackage != pkg) return@forEachIndexed
-            if (query.isNotEmpty() && e.query.isNotEmpty() && e.query.lowercase() != query) {
-                return@forEachIndexed
+        // 事件按最新在前排列，按时近性衰减
+        for ((i, item) in events.withIndex()) {
+            val e = asMap(item) ?: continue
+            if (asString(e["clickedPackage"]) != packageName) continue
+
+            // 可选的 query 精化匹配
+            val evtQuery = asString(e["query"])
+            if (query.isNotEmpty() && evtQuery.isNotEmpty() && evtQuery.lowercase() != query) {
+                continue
             }
-            val factor = 0.5.pow(i.toDouble() / halfLife.toDouble())
-            var rankBonus = 1.0
-            when (e.clickedRank) {
-                -1 -> rankBonus = 1.2
-                0 -> rankBonus = 1.0
-                else -> if (e.clickedRank > 0) rankBonus = 0.7
+
+            // 时近性衰减：rank 0 → factor 1，每 halfLife 个事件衰减一半
+            val factor = 0.5.pow(i.toDouble() / max(1, FEEDBACK_HALF_LIFE_EVENTS).toDouble())
+
+            // 排名加成：rank 0（顶部）确认强意图，rank -1（手动启动）更强
+            val rank = asInt(e["clickedRank"])
+            val rankBonus = when {
+                rank == -1 -> 1.2   // 手动启动
+                rank == 0 -> 1.0    // 已在顶部
+                rank > 0 -> 0.7     // 用户需要扫描
+                else -> 1.0
             }
             boost += factor * rankBonus
         }
-        return clampNum(boost / 3.0, 0.0, 1.0) * cfg.feedbackBoostMax
+        // 饱和求和：超过 ~3 个匹配事件后边际递减
+        return clamp(boost / 3.0, 0.0, 1.0) * FEEDBACK_BOOST_MAX
     }
 
     // ============================================================
-    // 工具函数
+    // 安全类型提取工具（处理 Base 返回的动态 JSON 结构）
     // ============================================================
-    private fun clampNum(v: Double, lo: Double, hi: Double): Double {
-        if (v.isNaN()) return lo
-        return max(lo, min(hi, v))
+
+    @Suppress("UNCHECKED_CAST")
+    private fun asMap(obj: Any?): Map<String, Any?>? = obj as? Map<String, Any?>
+
+    @Suppress("UNCHECKED_CAST")
+    private fun asList(obj: Any?): List<Any?>? = obj as? List<Any?>
+
+    private fun asInt(obj: Any?): Int = when (obj) {
+        is Number -> obj.toInt()
+        is String -> obj.toIntOrNull() ?: -1
+        else -> -1
     }
 
-    private fun round4(v: Double): Double {
-        if (v.isNaN()) return 0.0
-        return Math.round(v * 10000.0) / 10000.0
+    private fun asDouble(obj: Any?): Double = when (obj) {
+        is Number -> obj.toDouble()
+        is String -> obj.toDoubleOrNull() ?: 0.0
+        else -> 0.0
     }
 
-    private fun parseIsoTime(iso: String): Long {
+    private fun asString(obj: Any?): String = obj?.toString() ?: ""
+
+    private fun clamp(v: Double, lo: Double, hi: Double): Double = max(lo, min(hi, v))
+
+    /** 解析 ISO 8601 时间戳为毫秒，失败返回 -1 */
+    private fun parseIsoTimestamp(iso: String): Long {
+        if (iso.isEmpty()) return -1
         return try {
-            java.time.Instant.parse(iso).toEpochMilli()
+            // 简单解析：兼容 "2026-07-30T09:00:00Z" 格式
+            val cleaned = iso.replace("Z", "+00:00")
+            java.time.OffsetDateTime.parse(cleaned).toInstant().toEpochMilli()
         } catch (_: Throwable) {
-            try { java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssXXX").parse(iso)?.time ?: 0L }
-            catch (_: Throwable) { 0L }
+            try {
+                java.time.LocalDateTime.parse(iso)
+                    .toInstant(java.time.ZoneOffset.UTC).toEpochMilli()
+            } catch (_: Throwable) {
+                -1
+            }
         }
     }
 }

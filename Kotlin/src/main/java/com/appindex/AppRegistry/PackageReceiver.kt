@@ -3,81 +3,74 @@ package com.appindex.AppRegistry
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import android.net.Uri
-import android.util.Log
+import android.content.pm.ApplicationInfo
+import android.content.pm.PackageManager
+import com.appindex.BasicSearch.PinyinConverter
+import com.appindex.model.AppInfo
 
 /**
- * 应用变更监听 — Manifest 静态注册，常驻不依赖 ViewModel
+ * 应用增删改监听器（静态注册的 [BroadcastReceiver]）。
  *
- * V2.1 架构扩展：监听 PACKAGE_ADDED/REMOVED/CHANGED/REPLACED
+ * 监听系统 `ACTION_PACKAGE_ADDED` / `REMOVED` / `REPLACED` / `CHANGED` 广播，
+ * 增量更新 [AppListStore] 缓存，避免全量枚举 [PackageManager] 的开销。
  *
- * 收到广播 → 增量更新 [AppListStore] → 通过 [PackageChangeListener] 通知 Engine 重建索引
- * Engine 模块是 library，不能直接依赖 app 模块，故用回调接口由 app 层注册
+ * 注意：广播 Intent 的 data scheme 必须为 `"package"`，注册时需为
+ * IntentFilter 添加 `addDataScheme("package")`，否则收不到广播。
  */
 class PackageReceiver : BroadcastReceiver() {
 
     override fun onReceive(context: Context, intent: Intent) {
         val action = intent.action ?: return
-        val data: Uri? = intent.data
-        val packageName = data?.schemeSpecificPart
-        if (packageName.isNullOrEmpty()) return
+        val data = intent.data ?: return
+        val pkg = data.encodedSchemeSpecificPart
+        if (pkg.isNullOrEmpty()) return
 
-        val added: List<String>
-        val removed: List<String>
-        val changed: List<String>
+        val store = AppListStore(context)
+        // 确保缓存已加载，避免在空缓存上做增量
+        store.load()
 
         when (action) {
-            Intent.ACTION_PACKAGE_ADDED -> {
-                added = listOf(packageName)
-                removed = emptyList()
-                changed = emptyList()
+            Intent.ACTION_PACKAGE_ADDED,
+            Intent.ACTION_PACKAGE_REPLACED -> {
+                // REPLACED：覆盖更新（先移除旧信息再重新加入）
+                val app = resolveApp(context, pkg) ?: return
+                store.applyDelta(added = listOf(app), removed = listOf(pkg))
             }
             Intent.ACTION_PACKAGE_REMOVED -> {
-                added = emptyList()
-                removed = listOf(packageName)
-                changed = emptyList()
+                // 被替换时系统先发 REMOVED(EXTRA_REPLACING=true) 再发 ADDED，此时不应移除
+                if (intent.getBooleanExtra(Intent.EXTRA_REPLACING, false)) return
+                store.applyDelta(added = emptyList(), removed = listOf(pkg))
             }
-            Intent.ACTION_PACKAGE_CHANGED, Intent.ACTION_PACKAGE_REPLACED -> {
-                // REPLACED = 同包名卸载后重装，视为变更（重新查询元数据）
-                added = emptyList()
-                removed = emptyList()
-                changed = listOf(packageName)
+            Intent.ACTION_PACKAGE_CHANGED -> {
+                // 组件启用/禁用等变化，重新解析覆盖
+                val app = resolveApp(context, pkg) ?: return
+                store.applyDelta(added = listOf(app), removed = listOf(pkg))
             }
-            else -> return
-        }
-
-        // 增量更新应用清单
-        val store = AppListStore(context)
-        try {
-            store.applyDelta(added, removed, changed)
-        } catch (e: Throwable) {
-            Log.w(TAG, "applyDelta 失败: ${e.message}")
-        }
-
-        // 通知 app 层触发 Engine 重建索引
-        try {
-            listener?.onPackagesChanged(added, removed, changed)
-        } catch (e: Throwable) {
-            Log.w(TAG, "通知 listener 失败: ${e.message}")
         }
     }
 
-    /**
-     * 应用变更回调接口 — 由 app 层注册实现，触发 Engine 重建索引
-     */
-    interface PackageChangeListener {
-        fun onPackagesChanged(added: List<String>, removed: List<String>, changed: List<String>)
-    }
-
-    companion object {
-        private const val TAG = "PackageReceiver"
-
-        @Volatile
-        private var listener: PackageChangeListener? = null
-
-        /** app 层注册回调（例如在 SearchService 初始化时） */
-        fun setListener(l: PackageChangeListener?) {
-            listener = l
+    /** 根据 packageName 解析单个 [AppInfo]（不可见或已卸载时返回 null）。 */
+    private fun resolveApp(context: Context, pkg: String): AppInfo? {
+        val pm = context.packageManager
+        val appInfo = try {
+            pm.getApplicationInfo(pkg, PackageManager.GET_META_DATA)
+        } catch (_: Throwable) {
+            return null
         }
+        val label = try {
+            pm.getApplicationLabel(appInfo).toString()
+        } catch (_: Throwable) {
+            ""
+        }
+        if (label.isBlank()) return null
+        return AppInfo(
+            packageName = appInfo.packageName,
+            label = label,
+            pinyin = PinyinConverter.toPinyin(label),
+            pinyinInitials = PinyinConverter.toInitials(label),
+            pinyinArray = PinyinConverter.toPinyinArray(label),
+            icon = appInfo.loadIcon(pm),
+            isSystemApp = (appInfo.flags and ApplicationInfo.FLAG_SYSTEM) != 0
+        )
     }
 }

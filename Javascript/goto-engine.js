@@ -118,9 +118,73 @@
       byPrefix: new Map(),
       byChar: new Map(),
       byAppId: new Map(),
+      trie: _createTrieNode(),
       built: false,
       buildTime: 0
     };
+  }
+
+  // ═══ 前缀树（Trie）索引 — 精确匹配的延伸：可快速取到某前缀下的全部 App ═══
+  function _createTrieNode(){
+    return { children: new Map(), ids: new Set(), terminals: new Set() };
+  }
+  function _trieInsert(trie, str, id){
+    var node = trie;
+    for(var i = 0; i < str.length; i++){
+      var ch = str[i];
+      var next = node.children.get(ch);
+      if(!next){
+        next = _createTrieNode();
+        node.children.set(ch, next);
+      }
+      node = next;
+      node.ids.add(id);
+    }
+    node.terminals.add(id);
+  }
+  function _trieExactIds(trie, str){
+    var node = trie;
+    for(var i = 0; i < str.length; i++){
+      node = node.children.get(str[i]);
+      if(!node) return null;
+    }
+    return node.terminals;
+  }
+  function _triePrefixIds(trie, prefix){
+    var node = trie;
+    for(var i = 0; i < prefix.length; i++){
+      node = node.children.get(prefix[i]);
+      if(!node) return null;
+    }
+    // ids 沿途已聚合所有经过该前缀的 App，直接返回即可
+    return node.ids;
+  }
+  function _trieNodeContainsId(node, id){
+    if(node.terminals.has(id)) return true;
+    for(var iter = node.children.values(), step = iter.next(); !step.done; step = iter.next()){
+      if(_trieNodeContainsId(step.value, id)) return true;
+    }
+    return false;
+  }
+  function _trieRemove(trie, str, id){
+    function remove(node, depth){
+      if(depth === str.length){
+        var had = node.terminals.has(id);
+        node.terminals.delete(id);
+        node.ids.delete(id);
+        return had;
+      }
+      var ch = str[depth];
+      var child = node.children.get(ch);
+      if(!child) return false;
+      var childShouldDelete = remove(child, depth + 1);
+      if(childShouldDelete){
+        node.children.delete(ch);
+      }
+      if(!_trieNodeContainsId(node, id)) node.ids.delete(id);
+      return node.children.size === 0 && node.terminals.size === 0 && node.ids.size === 0;
+    }
+    return remove(trie, 0);
   }
 
   // v4.0: 第四层（梳理层）依赖 — 延迟加载，缺失时静默降级
@@ -160,15 +224,12 @@
     _personalRerankEnabled: true,
     // v3.3: Engine FeatureFlags — 统一模块开关，三语言必须一致
     _featureFlags: {
-      fuzzyMatch: true,          // 模糊匹配
-      indexTree: true,           // 索引树（预留，当前用 searchIndex）
-      adaptiveRefresh: true,     // 自适应刷新
-      simInt: false,             // 模拟智能（默认关闭）
-      t9: false,                 // T9 模式
-      ragFallback: false,        // RAG 兜底（默认关闭，最后调用）
-      personalRerank: true,      // L4 梳理层（与 _personalRerankEnabled 同步，向后兼容）
-      ragAutoRebuild: true,      // V2.1: 月度 RAG 自动重建（对齐 Kotlin）
-      ragTransitionEnabled: true // V2.1: RAG 新旧库灰度过渡（对齐 Kotlin）
+      fuzzyMatch: true,      // 模糊匹配
+      indexTree: true,       // 索引树（预留，当前用 searchIndex）
+      adaptiveRefresh: true, // 自适应刷新
+      simInt: false,         // 模拟智能（默认关闭）
+      t9: false,             // T9 模式
+      ragFallback: false     // RAG 兜底（默认关闭，最后调用）
     },
     setFeatureFlags: function(flags){
       if (flags && typeof flags === 'object') {
@@ -177,10 +238,6 @@
             engine._featureFlags[k] = !!flags[k];
           }
         });
-        // 同步 personalRerank 到独立变量（向后兼容 _personalRerankEnabled）
-        if ('personalRerank' in flags) {
-          engine._personalRerankEnabled = !!flags.personalRerank;
-        }
       }
       // 同步 simInt 到 localStorage
       if ('simInt' in (flags || {})) {
@@ -1197,6 +1254,10 @@
           if(!idx.byChar.has(ch)) idx.byChar.set(ch, []);
           idx.byChar.get(ch).push(id);
         });
+        // 前缀树索引：把各维度文本逐字插入，沿途记录 App ID，支持前缀扩展召回
+        [lowerText(app.name), py, lowerText(app.en), lowerText(app.abbr), ini, t9].forEach(function(source){
+          if(source && source.length > 0) _trieInsert(idx.trie, source, id);
+        });
       });
       idx.built = true;
       idx.buildTime = Math.round((((typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now()) - t0) * 100) / 100;
@@ -1313,6 +1374,149 @@
       }
       return boost;
     },
+
+    // ═══ 工具：把对象或字符串统一解析为 appId ═══
+    _resolveAppId: function(appOrId){
+      if(!appOrId) return '';
+      if(typeof appOrId === 'string' || typeof appOrId === 'number') return String(appOrId);
+      return String(appOrId.id || appOrId.name || appOrId.packageName || '');
+    },
+
+    // ═══ 统计型排序分（不依赖模拟智能开关）═══
+    _getLaunchCountBoostById: function(appId){
+      try{
+        var stats = readJSON('goto_app_stats', {}) || {};
+        var uses = ((stats[appId] || {}).uses) || 0;
+        return Math.min(80, uses * 2);
+      }catch(_){ return 0; }
+    },
+    _getLastUsedBoostById: function(appId){
+      try{
+        var stats = readJSON('goto_app_stats', {}) || {};
+        var lastUsed = (stats[appId] || {}).lastUsed;
+        if(!lastUsed) return 0;
+        var days = (Date.now() - lastUsed) / 86400000;
+        if(days < 1) return 28;
+        if(days < 3) return 18;
+        if(days < 7) return 10;
+        if(days < 30) return 4;
+        return 0;
+      }catch(_){ return 0; }
+    },
+    _getUsageScore: function(app, query, mode){
+      var id = app.id || app.name;
+      var name = app.name || '';
+      var score = 0;
+      score += this._getTemporalBoost(query, name);
+      score += this._getLaunchCountBoostById(id);
+      score += this._getInstalledBoost(name);
+      score += this._getModeFrequencyBoost(mode);
+      score += this._getLastUsedBoostById(id);
+      return score;
+    },
+
+    // ═══ 精确/前缀结果统一格式化（含个性化加权与屏蔽过滤）═══
+    _formatResult: function(apps, query, hitLabel, modeLabel, modeKey, t0){
+      var q = normalizeText(query);
+      var list = apps || [];
+      var out = [];
+      list.forEach(function(app){
+        var name = app.name || '';
+        var id = app.id || app.name;
+        // 基础命中分：精确 > 前缀
+        var score = (hitLabel === '精确') ? 1000 : 800;
+        // 统计型排序分（启动次数 / 最近使用 / 已安装 / 时段 / 模式频率）不依赖模拟智能
+        score += engine._getUsageScore(app, q, hitLabel);
+        if(engine.isSimIntEnabled()){
+          score += engine._getWeightBoost(q, name);
+          score += engine._contextRuleBoost(q, app);
+          score += engine._getProContextBoost(q, app);
+          if(engine.isEnhancedSimIntEnabled()) score += engine._getMicroContextBoost(q, app);
+        }
+        out.push({ app: app, score: Math.max(0, Math.round(score)), appId: id });
+      });
+      if(engine.isSimIntEnabled()){
+        out = out.filter(function(item){ return !engine.isBlockFlagged(q, item.app.name || ''); });
+      }
+      out.sort(function(a, b){ return b.score - a.score; });
+      var scores = {}, hits = {}, modeMap = {};
+      out.forEach(function(item){
+        scores[item.appId] = item.score;
+        hits[item.appId] = [hitLabel];
+        modeMap[item.appId] = modeLabel;
+      });
+      return {
+        list: out.slice(0, 30).map(function(item){ return item.app; }),
+        scores: scores,
+        hits: hits,
+        modeMap: modeMap,
+        mode: modeKey,
+        dt: nowTs() - (t0 || nowTs())
+      };
+    },
+
+    // ═══ 1. 精确匹配：命中完整 term 才返回 ═══
+    exactSearch: function(query, apps){
+      var q = normalizeText(query);
+      if(!q) return { list:[], mode:'idle', scores:{}, hits:{}, modeMap:{}, dt:0 };
+      var t0 = nowTs();
+      var lower = q.toLowerCase();
+      var searchApps = apps || global._appDataset || [];
+      this.watchAppDataset(searchApps);
+      var idx = this.searchIndex;
+      var matches = [];
+      if(idx.built && idx.trie){
+        var ids = _trieExactIds(idx.trie, lower);
+        if(ids && ids.size > 0){
+          ids.forEach(function(id){
+            var app = idx.byAppId.get(id);
+            if(app) matches.push(app);
+          });
+        }
+      }
+      if(matches.length === 0){
+        // fallback：线性精确匹配
+        searchApps.forEach(function(app){
+          if(lowerText(app.name) === lower || lowerText(app.py) === lower || lowerText(app.en) === lower || lowerText(app.abbr) === lower){
+            matches.push(app);
+          }
+        });
+      }
+      return this._formatResult(matches, q, '精确', '精确匹配', 'exact', t0);
+    },
+
+    // ═══ 2. 前缀索引：通过前缀树取出以 query 开头的全部 App ═══
+    prefixSearch: function(query, apps){
+      var q = normalizeText(query);
+      if(!q) return { list:[], mode:'idle', scores:{}, hits:{}, modeMap:{}, dt:0 };
+      var t0 = nowTs();
+      var lower = q.toLowerCase();
+      var searchApps = apps || global._appDataset || [];
+      this.watchAppDataset(searchApps);
+      var idx = this.searchIndex;
+      var matches = [];
+      if(idx.built && idx.trie){
+        var ids = _triePrefixIds(idx.trie, lower);
+        if(ids && ids.size > 0){
+          ids.forEach(function(id){
+            var app = idx.byAppId.get(id);
+            if(app) matches.push(app);
+          });
+        }
+      }
+      if(matches.length === 0){
+        // fallback：线性前缀匹配
+        searchApps.forEach(function(app){
+          var name = lowerText(app.name), py = lowerText(app.py), en = lowerText(app.en), abbr = lowerText(app.abbr);
+          if(name.indexOf(lower) === 0 || py.indexOf(lower) === 0 || en.indexOf(lower) === 0 || abbr.indexOf(lower) === 0){
+            matches.push(app);
+          }
+        });
+      }
+      return this._formatResult(matches, q, '前缀', '前缀索引', 'prefix', t0);
+    },
+
+    // ═══ 3. 模糊匹配（兜底）═══
     fuzzySearch: function(query, apps){
       var q = normalizeText(query);
       if(!q) return { list:[], mode:'idle', scores:{}, hits:{}, modeMap:{}, dt:0 };
@@ -1377,23 +1581,28 @@
       try{
         var candidateSet = null;
         if(idx.built && searchApps === global._appDataset){
+          var seenIds = new Set();
           if(useT9){
-            candidateSet = idx.byT9.get(lower) || idx.byT9.get(lower.substring(0, Math.min(lower.length, 2))) || null;
-          }else if(lower.length === 1){
-            candidateSet = idx.byChar.get(lower) || null;
-          }else if(lower.length === 2){
-            var base = idx.byPrefix.get(lower) || [];
-            var seenIds = new Set(base);
-            (idx.byChar.get(lower[0]) || []).forEach(function(id){ seenIds.add(id); });
-            (idx.byChar.get(lower[1]) || []).forEach(function(id){ seenIds.add(id); });
-            candidateSet = Array.from(seenIds);
+            (idx.byT9.get(lower) || []).forEach(function(id){ seenIds.add(id); });
+            (idx.byT9.get(lower.substring(0, Math.min(lower.length, 2))) || []).forEach(function(id){ seenIds.add(id); });
           }else{
-            seenIds = new Set(idx.byPrefix.get(lower.substring(0, 2)) || []);
-            for(var ci=0;ci<Math.min(lower.length, 4);ci++){
-              (idx.byChar.get(lower[ci]) || []).forEach(function(id){ seenIds.add(id); });
+            // 前缀树召回：把 query 当作前缀，取子树下的全部 App（精确匹配的延伸）
+            var trieIds = _triePrefixIds(idx.trie, lower);
+            if(trieIds) trieIds.forEach(function(id){ seenIds.add(id); });
+            if(lower.length === 1){
+              (idx.byChar.get(lower) || []).forEach(function(id){ seenIds.add(id); });
+            }else if(lower.length === 2){
+              (idx.byPrefix.get(lower) || []).forEach(function(id){ seenIds.add(id); });
+              (idx.byChar.get(lower[0]) || []).forEach(function(id){ seenIds.add(id); });
+              (idx.byChar.get(lower[1]) || []).forEach(function(id){ seenIds.add(id); });
+            }else{
+              (idx.byPrefix.get(lower.substring(0, 2)) || []).forEach(function(id){ seenIds.add(id); });
+              for(var ci=0;ci<Math.min(lower.length, 4);ci++){
+                (idx.byChar.get(lower[ci]) || []).forEach(function(id){ seenIds.add(id); });
+              }
             }
-            candidateSet = Array.from(seenIds);
           }
+          if(seenIds.size > 0) candidateSet = Array.from(seenIds);
         }
         if(candidateSet && candidateSet.length > 0 && candidateSet.length < searchApps.length){
           searchApps = candidateSet.map(function(id){ return idx.byAppId.get(id); }).filter(Boolean);
@@ -1729,16 +1938,23 @@
     },
     runSearchPipeline: function(query, apps){
       var list = apps || global._appDataset || [];
-      var fuzzyResult = this.fuzzySearch(query, list);
+      // 搜索管线：精确 → 前缀 → 模糊
+      var stageResult = this.exactSearch(query, list);
+      if(!(stageResult.list && stageResult.list.length > 0)){
+        stageResult = this.prefixSearch(query, list);
+        if(!(stageResult.list && stageResult.list.length > 0)){
+          stageResult = this.fuzzySearch(query, list);
+        }
+      }
       var result = {
-        list: (fuzzyResult.list || []).slice(),
-        scores: Object.assign({}, fuzzyResult.scores || {}),
-        hits: Object.assign({}, fuzzyResult.hits || {}),
-        modeMap: Object.assign({}, fuzzyResult.modeMap || {}),
-        mode: fuzzyResult.mode || 'basic',
-        dt: fuzzyResult.dt || 0,
-        intentLabel: fuzzyResult.intentLabel || '',
-        intentCategory: fuzzyResult.intentCategory || ''
+        list: (stageResult.list || []).slice(),
+        scores: Object.assign({}, stageResult.scores || {}),
+        hits: Object.assign({}, stageResult.hits || {}),
+        modeMap: Object.assign({}, stageResult.modeMap || {}),
+        mode: stageResult.mode || 'basic',
+        dt: stageResult.dt || 0,
+        intentLabel: stageResult.intentLabel || '',
+        intentCategory: stageResult.intentCategory || ''
       };
 
       if(document.body.classList.contains('meta-tag-enabled')){
@@ -2727,15 +2943,56 @@
       }
     },
 
+    // ═══ 前缀树索引外部接口（隐藏入口，但允许任意修改/扩展）═══
+    trieIndex: {
+      insert: function(term, appOrId){
+        var id = engine._resolveAppId(appOrId);
+        if(!id || !term) return false;
+        _trieInsert(engine.searchIndex.trie, lowerText(term), id);
+        return true;
+      },
+      remove: function(term, appOrId){
+        var id = engine._resolveAppId(appOrId);
+        if(!id || !term) return false;
+        return _trieRemove(engine.searchIndex.trie, lowerText(term), id);
+      },
+      exactSearch: function(term){
+        if(!term) return new Set();
+        var ids = _trieExactIds(engine.searchIndex.trie, lowerText(term));
+        return ids ? new Set(ids) : new Set();
+      },
+      prefixSearch: function(prefix){
+        if(!prefix) return new Set();
+        var ids = _triePrefixIds(engine.searchIndex.trie, lowerText(prefix));
+        return ids ? new Set(ids) : new Set();
+      },
+      getRoot: function(){
+        return engine.searchIndex.trie;
+      },
+      rebuild: function(){
+        engine.buildSearchIndex(global._appDataset || []);
+        return engine.searchIndex.trie;
+      }
+    },
+
     installGlobals: function(){
       global.GOTOEngine = this;
       global.setContext = this.setContext.bind(this);
       global.clearContext = this.clearContext.bind(this);
       global.getGotoEngineContext = this.getContext.bind(this);
       global._fuzzySearch = this.fuzzySearch.bind(this);
+      global._exactSearch = this.exactSearch.bind(this);
+      global._prefixSearch = this.prefixSearch.bind(this);
       global._buildSearchIndex = this.buildSearchIndex.bind(this);
       global._watchAppDataset = this.watchAppDataset.bind(this);
       global._metaTagSearch = this.metaSearch.bind(this);
+      // 前缀树索引扩展接口（隐藏入口）
+      global._trieInsert = this.trieIndex.insert.bind(this.trieIndex);
+      global._trieRemove = this.trieIndex.remove.bind(this.trieIndex);
+      global._trieExactSearch = this.trieIndex.exactSearch.bind(this.trieIndex);
+      global._triePrefixSearch = this.trieIndex.prefixSearch.bind(this.trieIndex);
+      global._trieRebuild = this.trieIndex.rebuild.bind(this.trieIndex);
+      global._trieGetRoot = this.trieIndex.getRoot.bind(this.trieIndex);
       global._refreshSimIntPanel = this.refreshSimIntPanel.bind(this);
       global._recordSimIntSearch = this.recordSearch.bind(this);
       global._recordSimIntSelection = this.recordSelection.bind(this);

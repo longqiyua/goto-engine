@@ -1,6 +1,6 @@
 # GOTO Engine
 
-> **V2.1** · GOTO 的搜索引擎层 — 无状态、只读、冻结。
+> **V2.1 update** · GOTO 的搜索引擎层 — 无状态、只读、冻结。
 >
 > 负责搜索、匹配、纠错、排序、RAG 重建，不含任何用户数据。
 >
@@ -8,12 +8,12 @@
 
 ## 四层架构
 
-GOTO Engine V2.1 采用四层架构（内部联动，对外统一）：
+GOTO Engine V2.1 update 采用四层架构（内部联动，对外统一）：
 
 | 层 | 模块 | 职责 | 回馈方向 |
 |---|---|---|---|
 | L1 自适应刷新层 | AdaptiveRefresh | 打字速度测量、防抖节流 | → 回馈给 Engine（调整搜索时机） |
-| L2 模糊匹配层 | FuzzyMatch + IndexTree | 精确/前缀/包含/模糊/T9 匹配 | → 核心搜索结果 |
+| L2 模糊匹配层 | FuzzyMatch + IndexTree + Trie | 精确/前缀/包含/模糊/T9 匹配 | → 核心搜索结果 |
 | L3 模拟智能层 | SimInt / PersonalRanker | 微观上下文、时段加分、权重加分 | → Engine 访问 Base（增强排序） |
 | L4 梳理层 | PersonalReranker | 融合 Base 个人层 5 schema 重排 | → Engine 无状态重排 |
 
@@ -31,10 +31,12 @@ GOTO Engine V2.1 采用四层架构（内部联动，对外统一）：
              ▼
 ┌─────────────────────────────┐
 │  L2 模糊匹配层                │
-│  · 精确 / 前缀 / 包含         │
+│  · 精确 / 前缀（Trie 扩展）   │
+│  · 包含                       │
 │  · 模糊（Jaccard + 顺序恢复） │
 │  · T9                        │
 │  · IndexTree 索引树          │
+│  · Trie 前缀树扩展接口        │
 │  · 高斯核键距容错             │
 └────────────┬────────────────┘
              │
@@ -56,7 +58,34 @@ GOTO Engine V2.1 采用四层架构（内部联动，对外统一）：
 └─────────────────────────────┘
 ```
 
-## V2.1 新增能力
+## 搜索管线：精确 → 前缀 → 模糊
+
+`runSearchPipeline(query, apps)` 现在按三级优先级执行：
+
+```
+runSearchPipeline(query, apps)
+    ├── exactSearch(query, apps)      # 完整 term 精确命中
+    ├── prefixSearch(query, apps)     # Trie 前缀树扩展召回
+    └── fuzzySearch(query, apps)      # 模糊匹配兜底
+```
+
+1. **精确匹配**：name / py / en / abbr 完全等于 query 才返回。
+2. **前缀索引**：基于 Trie 前缀树，返回所有以 query 开头的 App；Trie 节点维护 `ids`（前缀下全部 App）和 `terminals`（精确结尾 App）。
+3. **模糊匹配**：仅当前两级无结果时才进入模糊匹配；保留原有 MECE 5 维度作为兜底召回。
+
+### 统计型排序（不依赖模拟智能）
+
+精确/前缀命中的结果会按以下统计信息排序，**无需开启模拟智能**：
+
+- 启动次数
+- 最近使用时间
+- 是否已安装
+- 时段偏好
+- 模式频率
+
+模拟智能相关的加分（学习权重、上下文规则、Pro 模式、微观上下文）仅在功能开启时追加。
+
+## V2.1 update 新增能力
 
 ### 1. 梳理层（PersonalReranker）
 
@@ -72,7 +101,28 @@ GOTO Engine V2.1 采用四层架构（内部联动，对外统一）：
 
 **无状态设计**：Engine 不存储学习状态，通过 `EngineBaseBridge` 实时读取 Base 个人层数据，调用 `PersonalReranker` 纯函数重排。Base 是唯一持久状态层。
 
-### 2. 月度 RAG 自动重建
+### 2. 前缀树索引扩展接口
+
+Trie 前缀树提供隐藏但可调用的外部扩展接口，允许任意修改/扩展索引：
+
+```js
+// JavaScript 版示例
+gotoEngine.trieIndex.insert(term, appOrId)
+gotoEngine.trieIndex.remove(term, appOrId)
+gotoEngine.trieIndex.exactSearch(term)
+gotoEngine.trieIndex.prefixSearch(prefix)
+gotoEngine.trieIndex.rebuild()
+gotoEngine.trieIndex.getRoot()
+```
+
+三语言（JS / Kotlin / Rust）需对齐以下能力：
+
+- `insert(term, appOrId)` / `remove(term, appOrId)` — 动态增删 term ↔ App 映射
+- `exactSearch(term)` / `prefixSearch(prefix)` — 精确与前缀查询
+- `rebuild()` — 根据当前数据集重建整棵树
+- `getRoot()` — 取根节点（调试用）
+
+### 3. 月度 RAG 自动重建
 
 | 组件 | 职责 |
 |------|------|
@@ -84,7 +134,7 @@ GOTO Engine V2.1 采用四层架构（内部联动，对外统一）：
 
 **数据流**：设备应用清单 + Base 个人层 snapshot → BGE-small 模型生成向量 → 写 `goto-base/shared/data/personal/rag/` 新库 → 时间线性权重灰度过渡 15 天 → 删旧库。
 
-### 3. BM25 自动语义检索
+### 4. BM25 自动语义检索
 
 运行时无需神经网络模型，基于 documentText 自动建 BM25 倒排索引：
 - 中文 unigram + bigram 分词
@@ -127,6 +177,7 @@ GOTO Engine V2.1 采用四层架构（内部联动，对外统一）：
 
 | 树类型 | 构建方式 | 用途 |
 |---|---|---|
+| Trie 前缀树 | 综合 name / py / en / abbr / initials / T9 逐字建 Trie | 精确匹配 + 前缀扩展召回，支持外部扩展接口 |
 | 英文单词树 | 按字母建 Trie（w→e→c→h） | 英文软件名前缀/子序列匹配 |
 | 中文拼音树 | 按拼音字母建 Trie | 拼音前缀/子序列匹配 |
 | 中文汉字树 | 按汉字建 Trie | 汉字前缀/子序列匹配 |
@@ -167,13 +218,16 @@ Engine 启动时自动执行一次，运行时按需触发：
 |---|---|---|---|---|
 | JavaScript | `Javascript/` | 2.1.0 | Web / Electron / GithubPages | node --check + 运行时加载 |
 | Kotlin | `Kotlin/` | v2.1.0 | Android 原生（GOTO 应用嵌入） | Gradle compileDebugKotlin |
-| Rust | `Rust/` | 2.1.0 | 高性能 / 跨平台 / no_std | cargo test（173 测试通过） |
+| Rust | `Rust/` | 2.1.0 | 高性能 / 跨平台 / no_std | cargo test（117 测试通过） |
 
 三语言共用同一套算法契约和 FeatureFlags，模块开关必须一致。
 
 ### 三语言对齐项
 
 - **四层架构**：L1 自适应刷新 / L2 模糊匹配 / L3 模拟智能 / L4 梳理层
+- **搜索管线**：`exactSearch` → `prefixSearch` → `fuzzySearch`
+- **Trie 前缀树扩展接口**：insert / remove / exactSearch / prefixSearch / rebuild / getRoot
+- **统计型排序**：启动次数 / 最近使用 / 已安装 / 时段 / 模式频率，不依赖 simInt
 - **Base 桥接**：`EngineBaseBridge`（6 读 1写，读取 5 schema + affinities）
 - **RAG 重建**：`RagRebuilder`（512 维，`EmbedderPort` 注入）+ `RagTransitionController`（15 天灰度）
 - **BM25 检索**：`BM25RagSearch`（中文 unigram+bigram，IDF 加权）

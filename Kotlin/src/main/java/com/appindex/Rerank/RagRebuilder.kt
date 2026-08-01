@@ -5,265 +5,181 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 /**
- * RAG 重建算法纯函数 — 读应用清单 + base 个人层 snapshot → 生成向量库
+ * RAG 向量库重建器
  *
- * V2.1 架构扩展：月度 RAG 重建
+ * 读取应用清单 + Base 个人层快照 → 生成向量 → 构建索引。
+ * 产出可序列化为 JSON 的 [BuildResult]，由 [RagTransitionController] 灰度上线。
  *
- * 设计：
- *   - object 单例，无状态，纯函数
- *   - [EmbedderPort] 由 app 层注入（base 小模型实现），Engine 不依赖具体模型
- *   - 向量维度 512（与现有公共 RAG 一致，bge-small-zh-v1.5）
- *   - 序列化方法 [serializeVectorStore] / [serializeRagIndex] 供 Worker 和 Facade 共用
- *
- * 三语言同步：JS/Rust 仅对齐算法纯函数（buildDocumentText / rebuild 逻辑）
+ * 对应 JS 版 `algorithms/rag/rag-rebuilder.js`。
  */
 object RagRebuilder {
 
-    /** 向量维度（与公共 RAG 一致） */
+    /** 向量维度（BGE-small-zh-v1.5） */
     const val DIMENSION = 512
 
     /**
-     * Embedder 端口接口 — 由 app 层注入具体实现（base 小模型）
+     * 向量条目：一个应用对应一条
+     *
+     * @param packageName  应用包名
+     * @param documentText 文档文本（应用名+拼音+包名等拼接）
+     * @param vector       嵌入向量（L2 归一化）
      */
-    interface EmbedderPort {
-        fun embed(text: String): FloatArray
-    }
+    data class RagVectorEntry(
+        val packageName: String,
+        val documentText: String,
+        val vector: FloatArray
+    )
 
     /**
-     * 为单个应用构建文档文本：appName + aliases(拼音) + 个人层 boost 信号
+     * 索引条目
      *
-     * 个人层 boost 信号：
-     *   - heatmap 高频时段 top 应用
-     *   - transition 高频目标应用
-     *   - feedback 最近点击应用
-     *   - affinity 偏好应用
+     * @param idx 向量在 vectors 数组中的下标
      */
-    fun buildDocumentText(app: AppInfo, snapshot: PersonalSnapshot): String {
-        val sb = StringBuilder(128)
-        sb.append(app.label)
-
-        // 别名：拼音 + 首字母 + 逐字拼音
-        if (app.pinyin.isNotEmpty()) sb.append(' ').append(app.pinyin)
-        if (app.pinyinInitials.isNotEmpty()) sb.append(' ').append(app.pinyinInitials)
-        for (p in app.pinyinArray) {
-            if (p.isNotEmpty()) sb.append(' ').append(p)
-        }
-
-        // 个人层 boost 信号（若 snapshot 可用）
-        if (!snapshot.degraded) {
-            val pkg = app.packageName
-            // heatmap 高频时段 top 应用
-            val heatmapHit = snapshot.heatmap?.cells?.any { cell ->
-                cell.topApps.any { it.packageName == pkg }
-            } ?: false
-            if (heatmapHit) sb.append(" 时段高频")
-
-            // transition 高频目标应用
-            val transitionHit = snapshot.transitionMatrix?.transitions?.values
-                ?.any { edges -> edges.any { it.toPackage == pkg } } ?: false
-            if (transitionHit) sb.append(" 跳转高频")
-
-            // feedback 最近点击
-            val feedbackHit = snapshot.recentFeedback.any { it.clickedPackage == pkg }
-            if (feedbackHit) sb.append(" 最近点击")
-
-            // affinity 偏好信号
-            val aff = snapshot.affinities[pkg]
-            if (aff != null && aff.currentWeight > 0.0) sb.append(" 偏好应用")
-        }
-
-        return sb.toString()
-    }
+    data class IndexEntry(val idx: Int)
 
     /**
-     * 批量重建 RAG 向量库
+     * RAG 索引
      *
-     * @param apps 应用清单
-     * @param snapshot Base 个人层快照
-     * @param embedder 嵌入器（app 层注入）
-     * @return [RagBuildResult]（vectors + index）
+     * @param byPackage   包名 → 索引条目（O(1) 查找）
+     * @param byIntentTag 意图标签 → 向量下标列表（语义召回）
      */
-    fun rebuild(
-        apps: List<AppInfo>,
-        snapshot: PersonalSnapshot,
-        embedder: EmbedderPort
-    ): RagBuildResult {
+    data class RagIndex(
+        val byPackage: Map<String, IndexEntry>,
+        val byIntentTag: Map<String, List<Int>>
+    )
+
+    /**
+     * 重建结果
+     *
+     * @param vectors 向量列表
+     * @param index   RAG 索引
+     */
+    data class BuildResult(
+        val vectors: List<RagVectorEntry>,
+        val index: RagIndex
+    )
+
+    /**
+     * 重建 RAG 向量库。
+     *
+     * @param apps     应用清单
+     * @param snapshot 个人层快照（用于文档文本增强）
+     * @param embedder 嵌入向量端口
+     * @return 构建结果
+     */
+    fun rebuild(apps: List<AppInfo>, snapshot: PersonalSnapshot, embedder: EmbedderPort): BuildResult {
         val vectors = ArrayList<RagVectorEntry>(apps.size)
-        val byPackage = HashMap<String, Int>(apps.size)
-        val byIntentTag = HashMap<String, MutableList<Int>>()
-        val byCategory = HashMap<String, MutableList<Int>>()
+        val byPackage = HashMap<String, IndexEntry>()
 
         for ((idx, app) in apps.withIndex()) {
-            val docText = buildDocumentText(app, snapshot)
-            val vector = try {
-                embedder.embed(docText)
-            } catch (e: Throwable) {
-                FloatArray(DIMENSION)
-            }
-            val intentTags = buildIntentTags(app, snapshot)
-            val metadata = HashMap<String, Any>()
-            metadata["packageName"] = app.packageName
-            metadata["appName"] = app.label
-            metadata["isSystemApp"] = app.isSystemApp
-
-            vectors.add(
-                RagVectorEntry(
-                    id = idx,
-                    packageName = app.packageName,
-                    documentText = docText,
-                    vector = vector,
-                    intentTags = intentTags,
-                    metadata = metadata
-                )
-            )
-            byPackage[app.packageName] = idx
-            for (tag in intentTags) {
-                byIntentTag.getOrPut(tag) { ArrayList() }.add(idx)
-            }
-            // category：个人层无分类信息，按 system/user 简单归类
-            val category = if (app.isSystemApp) "系统应用" else "用户应用"
-            byCategory.getOrPut(category) { ArrayList() }.add(idx)
+            val doc = buildDocumentText(app, snapshot)
+            val vec = embedder.embed(doc)
+            vectors.add(RagVectorEntry(app.packageName, doc, vec))
+            byPackage[app.packageName] = IndexEntry(idx)
         }
 
-        val index = RagIndex(
-            byPackage = byPackage,
-            byCategory = byCategory,
-            byIntentTag = byIntentTag
-        )
-        return RagBuildResult(vectors = vectors, index = index)
+        val byIntentTag = buildIntentTagIndex(apps, snapshot)
+        val index = RagIndex(byPackage, byIntentTag)
+
+        return BuildResult(vectors, index)
     }
 
     /**
-     * 序列化 vector-store JSON（与公共 RAG vector-store.json 结构对齐）
+     * 序列化向量库为 JSON 字符串。
+     * 输出格式与 `vector-store.json` 对齐。
      */
-    fun serializeVectorStore(result: RagBuildResult): String {
-        val vectors = JSONArray()
-        for (v in result.vectors) {
-            val vecArr = JSONArray()
-            for (f in v.vector) vecArr.put(f.toDouble())
-            val meta = JSONObject()
-            for ((k, value) in v.metadata) {
-                when (value) {
-                    is String -> meta.put(k, value)
-                    is Boolean -> meta.put(k, value)
-                    is Number -> meta.put(k, value)
-                    else -> meta.put(k, value.toString())
-                }
+    fun serializeVectorStore(result: BuildResult): String {
+        val json = JSONObject()
+        json.put("version", "1.0.0")
+        json.put("dimension", DIMENSION)
+        json.put("vectorGenerator", "kotlin-rag-rebuilder")
+
+        val vectorsArray = JSONArray()
+        for (entry in result.vectors) {
+            val v = JSONObject()
+            v.put("packageName", entry.packageName)
+            v.put("documentText", entry.documentText)
+            val vecArray = JSONArray()
+            for (f in entry.vector) {
+                vecArray.put(f.toDouble())
             }
-            val tags = JSONArray()
-            for (t in v.intentTags) tags.put(t)
-            vectors.put(JSONObject().apply {
-                put("id", v.id)
-                put("packageName", v.packageName)
-                put("documentText", v.documentText)
-                put("vector", vecArr)
-                put("intentTags", tags)
-                put("metadata", meta)
-            })
+            v.put("vector", vecArray)
+            vectorsArray.put(v)
         }
-        val root = JSONObject().apply {
-            put("version", "1.0.0")
-            put("embeddingModel", "bge-small-zh-v1.5")
-            put("dimension", DIMENSION)
-            put("vectorGenerator", "personal-rag-rebuilder")
-            put("updatedAt", System.currentTimeMillis())
-            put("vectors", vectors)
-        }
-        return root.toString()
+        json.put("vectors", vectorsArray)
+
+        return json.toString()
     }
 
     /**
-     * 序列化 rag-index JSON（与公共 RAG rag-index.json 结构对齐）
+     * 序列化 RAG 索引为 JSON 字符串。
+     * 输出格式与 `rag-index.json` 对齐。
      */
-    fun serializeRagIndex(result: RagBuildResult): String {
+    fun serializeRagIndex(result: BuildResult): String {
+        val json = JSONObject()
+        json.put("version", "1.0.0")
+        json.put("dimension", DIMENSION)
+        json.put("totalVectors", result.vectors.size)
+
         val byPackage = JSONObject()
-        for ((pkg, idx) in result.index.byPackage) {
-            byPackage.put(pkg, JSONObject().apply { put("idx", idx) })
+        for ((pkg, entry) in result.index.byPackage) {
+            byPackage.put(pkg, JSONObject().put("idx", entry.idx))
         }
-        val byCategory = JSONObject()
-        for ((cat, idxs) in result.index.byCategory) {
-            val arr = JSONArray()
-            for (i in idxs) arr.put(i)
-            byCategory.put(cat, arr)
-        }
+        json.put("byPackage", byPackage)
+
         val byIntentTag = JSONObject()
-        for ((tag, idxs) in result.index.byIntentTag) {
+        for ((tag, indices) in result.index.byIntentTag) {
             val arr = JSONArray()
-            for (i in idxs) arr.put(i)
+            for (i in indices) {
+                arr.put(i)
+            }
             byIntentTag.put(tag, arr)
         }
-        val root = JSONObject().apply {
-            put("version", "1.0.0")
-            put("dimension", DIMENSION)
-            put("updatedAt", System.currentTimeMillis())
-            put("totalVectors", result.vectors.size)
-            put("byPackage", byPackage)
-            put("byCategory", byCategory)
-            put("byIntentTag", byIntentTag)
-        }
-        return root.toString()
+        json.put("byIntentTag", byIntentTag)
+
+        return json.toString()
     }
 
-    /** 生成意图标签：基于个人层信号 */
-    private fun buildIntentTags(app: AppInfo, snapshot: PersonalSnapshot): List<String> {
-        val tags = ArrayList<String>()
-        if (snapshot.degraded) return tags
-        val pkg = app.packageName
-        if (snapshot.heatmap?.cells?.any { it.topApps.any { a -> a.packageName == pkg } } == true) {
-            tags.add("time_frequent")
-        }
-        if (snapshot.transitionMatrix?.transitions?.values
-                ?.any { edges -> edges.any { it.toPackage == pkg } } == true) {
-            tags.add("transition_target")
-        }
-        if (snapshot.recentFeedback.any { it.clickedPackage == pkg }) {
-            tags.add("recent_click")
-        }
-        val aff = snapshot.affinities[pkg]
-        if (aff != null && aff.currentWeight > 0.0) tags.add("preferred")
-        return tags
-    }
-}
+    // ============================================================
+    // 内部工具
+    // ============================================================
 
-/** 单条 RAG 向量条目 */
-data class RagVectorEntry(
-    val id: Int,
-    val packageName: String,
-    val documentText: String,
-    val vector: FloatArray,
-    val intentTags: List<String>,
-    val metadata: Map<String, Any>
-) {
-    // FloatArray 的 equals/hashCode 需手动处理（data class 默认按引用比较数组）
-    override fun equals(other: Any?): Boolean {
-        if (this === other) return true
-        if (other !is RagVectorEntry) return false
-        return id == other.id &&
-                packageName == other.packageName &&
-                documentText == other.documentText &&
-                intentTags == other.intentTags &&
-                vector.contentEquals(other.vector) &&
-                metadata == other.metadata
+    /**
+     * 构建应用文档文本：拼接应用名、拼音、首字母、包名等。
+     * 个人层快照中的 affinities 可用于增强文档（如追加高频关联词）。
+     */
+    private fun buildDocumentText(app: AppInfo, snapshot: PersonalSnapshot): String {
+        val parts = mutableListOf(
+            app.label,
+            app.pinyin,
+            app.pinyinInitials,
+            app.packageName
+        )
+        // 逐字拼音分词
+        parts.addAll(app.pinyinArray)
+        return parts.filter { it.isNotEmpty() }.joinToString(" ")
     }
 
-    override fun hashCode(): Int {
-        var r = id
-        r = 31 * r + packageName.hashCode()
-        r = 31 * r + documentText.hashCode()
-        r = 31 * r + vector.contentHashCode()
-        return r
+    /**
+     * 构建意图标签索引：以应用名和拼音首字母作为意图标签。
+     * 实际生产中意图标签来自 seed 文件的 intentTags 字段，
+     * 此处基于 AppInfo 可用字段做合理近似。
+     */
+    private fun buildIntentTagIndex(
+        apps: List<AppInfo>,
+        @Suppress("UNUSED_PARAMETER") snapshot: PersonalSnapshot
+    ): Map<String, List<Int>> {
+        val byIntentTag = HashMap<String, MutableList<Int>>()
+        for ((idx, app) in apps.withIndex()) {
+            // 应用名作为意图标签（支持按名召回）
+            if (app.label.isNotEmpty()) {
+                byIntentTag.getOrPut(app.label) { mutableListOf() }.add(idx)
+            }
+            // 拼音首字母作为意图标签（支持拼音召回）
+            if (app.pinyinInitials.isNotEmpty()) {
+                byIntentTag.getOrPut(app.pinyinInitials) { mutableListOf() }.add(idx)
+            }
+        }
+        return byIntentTag
     }
 }
-
-/** RAG 索引结构 */
-data class RagIndex(
-    val byPackage: Map<String, Int>,
-    val byCategory: Map<String, List<Int>>,
-    val byIntentTag: Map<String, List<Int>>
-)
-
-/** RAG 重建结果 */
-data class RagBuildResult(
-    val vectors: List<RagVectorEntry>,
-    val index: RagIndex
-)

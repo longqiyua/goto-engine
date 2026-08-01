@@ -5,6 +5,14 @@
 > 运行于浏览器 / WebView / Node.js，单文件 IIFE 封装，零依赖、零构建、即插即用。
 > 是 GOTO Engine 的算法母体，包含完整 18 模块。License：GNU AGPL-3.0（详见 [LICENSE](LICENSE)）。
 
+## 版本
+
+**V2.1 update**
+
+- 搜索管线改为：**精确匹配 → 前缀索引 → 模糊匹配**
+- Trie 前缀树支持精确/前缀扩展召回，并暴露隐藏扩展接口
+- 精确/前缀结果可按统计信息排序（不依赖模拟智能）
+
 ## 模块清单
 
 | 文件 / 目录 | 职责 |
@@ -21,6 +29,53 @@
 | `dist/` | 浏览器打包（browser/：goto-engine.js + goto-engine-component.js + index.mjs） |
 | `scripts/` | 构建脚本（build-browser-bundle.js） |
 | `PLUGIN-GUIDE.md` / `EXTENSIONS.md` / `Intro.md` | 扩展文档 |
+
+## 搜索管线：精确 → 前缀 → 模糊
+
+```
+runSearchPipeline(query, apps)
+    ├── exactSearch(query, apps)      # 完整 term 精确命中
+    ├── prefixSearch(query, apps)     # Trie 前缀树扩展召回
+    └── fuzzySearch(query, apps)      # 模糊匹配兜底
+```
+
+- 精确匹配：name / py / en / abbr 完全等于 query。
+- 前缀索引：基于 Trie 返回所有以 query 开头的 App。
+- 模糊匹配：仅当前两级无结果时兜底。
+
+### 统计型排序（不依赖模拟智能）
+
+精确/前缀命中的结果会按以下统计信息排序，**无需开启模拟智能**：
+
+- 启动次数
+- 最近使用时间
+- 是否已安装
+- 时段偏好
+- 模式频率
+
+## Trie 前缀树扩展接口（隐藏入口）
+
+```js
+GOTOEngine.trieIndex.insert(term, appOrId)
+GOTOEngine.trieIndex.remove(term, appOrId)
+GOTOEngine.trieIndex.exactSearch(term)
+GOTOEngine.trieIndex.prefixSearch(prefix)
+GOTOEngine.trieIndex.rebuild()
+GOTOEngine.trieIndex.getRoot()
+```
+
+全局快捷函数：
+
+```js
+_trieInsert(term, appOrId)
+_trieRemove(term, appOrId)
+_trieExactSearch(term)
+_triePrefixSearch(prefix)
+_trieRebuild()
+_trieGetRoot()
+_exactSearch(query, apps)
+_prefixSearch(query, apps)
+```
 
 ## FeatureFlags 使用
 
@@ -45,7 +100,7 @@ engine.setFeatureFlags({
 | Flag | 默认 | 作用 |
 |---|---|---|
 | `fuzzyMatch` | `true` | 模糊匹配（Jaccard + 顺序恢复 + 缩写） |
-| `indexTree` | `true` | 索引树（英文单词树 + 中文汉字树 + 拼音树） |
+| `indexTree` | `true` | 索引树（英文单词树 + 中文汉字树 + 拼音树 + Trie 前缀树） |
 | `adaptiveRefresh` | `true` | 自适应刷新（打字速度 + 防抖节流） |
 | `simInt` | `false` | 模拟智能（微观上下文 + 时段加分） |
 | `t9` | `false` | T9 模式 |

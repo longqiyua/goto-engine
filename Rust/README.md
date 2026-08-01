@@ -6,12 +6,20 @@
 > 独立 crate，多线程安全（`Arc<RwLock>`），no_std 友好（`spin` + `alloc`），117 个测试全部通过。
 > License：GNU AGPL-3.0（详见 [LICENSE](LICENSE)）。
 
+## 版本
+
+**V2.1 update**
+
+- 搜索管线改为：`exact_search` → `prefix_search` → `fuzzy_search`
+- `TrieIndex` 支持精确/前缀扩展召回，并暴露扩展接口
+- 精确/前缀结果可按统计信息排序（不依赖模拟智能）
+
 ## 模块清单
 
 | 文件 | 职责 |
 |---|---|
 | `src/engine.rs` | `GotoEngine<S: Storage>` 主类（约 40+ pub 方法） |
-| `src/search.rs` | 搜索管线（`fuzzy_search` / `meta_search` / `run_search_pipeline` 三阶优先级） |
+| `src/search.rs` | 搜索管线（`exact_search` / `prefix_search` / `fuzzy_search` / `meta_search` / `run_search_pipeline`） |
 | `src/component.rs` | `EngineComponent` 封套 + `QueryResponse` / `QueryOptions` / 事件系统 |
 | `src/index.rs` | 索引层：`InvertedIndex`（倒排）+ `MetaIndex`（元标签）+ `TfidfIndex`（TF-IDF）+ `TrieIndex`（Trie 树） |
 | `src/nlp.rs` | 自然语言处理：拼音转换 + T9 编码 + Porter / BPE / Soundex |
@@ -38,6 +46,50 @@
 - `src/smart_reminder.rs` — 智能提醒核心算法
 - `src/semantic.rs` — L1/L2/L3 三层语义联想（可选模块）
 
+## 搜索管线：精确 → 前缀 → 模糊
+
+```
+run_search_pipeline(query, apps)
+    ├── exact_search(query, apps)      # 完整 term 精确命中
+    ├── prefix_search(query, apps)     # Trie 前缀树扩展召回
+    └── fuzzy_search(query, apps)      # 模糊匹配兜底
+```
+
+- **精确匹配**：name / py / en / abbr 完全等于 query。
+- **前缀索引**：基于 `TrieIndex` 返回所有以 query 开头的 App；节点维护 `ids`（前缀下全部 App）和 `terminals`（精确结尾 App）。
+- **模糊匹配**：仅当前两级无结果时兜底。
+
+### 统计型排序（不依赖模拟智能）
+
+精确/前缀命中的结果会按以下统计信息排序，**无需开启模拟智能**：
+
+- 启动次数
+- 最近使用时间
+- 是否已安装
+- 时段偏好
+- 模式频率
+
+## Trie 前缀树扩展接口（隐藏入口）
+
+```rust
+engine.trie_index().insert(term, app_or_id)?;
+engine.trie_index().remove(term, app_or_id)?;
+engine.trie_index().exact_search(term);
+engine.trie_index().prefix_search(prefix);
+engine.trie_index().rebuild(&apps);
+engine.trie_index().root();
+```
+
+Rust 版 `TrieIndex` 节点结构：
+
+```rust
+struct TrieNode {
+    children: HashMap<char, TrieNode>,
+    ids: HashSet<String>,      // 经过该前缀的全部 App ID
+    terminals: HashSet<String>,// 恰好以该节点结尾的 App ID
+}
+```
+
 ## FeatureFlags 使用
 
 通过 `SearchConfig` 结构体配置模块开关，三语言必须保持一致：
@@ -47,7 +99,7 @@ use goto_engine::SearchConfig;
 
 let config = SearchConfig {
     fuzzy_match: true,       // 模糊匹配（Jaccard + 顺序恢复 + 缩写）
-    index_tree: true,        // 索引树（英文单词树 + 中文汉字树 + 拼音树）
+    index_tree: true,        // 索引树（英文单词树 + 中文汉字树 + 拼音树 + Trie 前缀树）
     adaptive_refresh: true,  // 自适应刷新（打字速度 + 防抖节流）
     sim_int: false,          // 模拟智能（微观上下文 + 时段加分）
     t9: false,               // T9 模式
@@ -58,7 +110,7 @@ let config = SearchConfig {
 | Flag | 默认 | 作用 |
 |---|---|---|
 | `fuzzy_match` | `true` | 模糊匹配（Jaccard + 顺序恢复 + 缩写） |
-| `index_tree` | `true` | 索引树（英文单词树 + 中文汉字树 + 拼音树） |
+| `index_tree` | `true` | 索引树（英文单词树 + 中文汉字树 + 拼音树 + Trie 前缀树） |
 | `adaptive_refresh` | `true` | 自适应刷新（打字速度 + 防抖节流） |
 | `sim_int` | `false` | 模拟智能（微观上下文 + 时段加分） |
 | `t9` | `false` | T9 模式 |
@@ -78,7 +130,7 @@ Rust 版 `types.rs` 定义以下匹配模式，对应 MECE 匹配维度：
 | `AdjacentSwap` | 50-400 | 相邻字符交换容错（高斯核键距） |
 | `Meta` | 80 | 分类兜底（分类名包含） |
 | `Tfidf` | — | TF-IDF 加权（重排阶段） |
-| `Trie` | — | Trie 索引树命中（前缀/子序列匹配） |
+| `Trie` | — | Trie 索引树命中（前缀/精确扩展召回） |
 
 `Initial` / `Prefix` / `Char` / `Disorder` 互斥，取最高分；`Meta` 为低分兜底，不互斥。
 
